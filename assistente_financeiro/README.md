@@ -224,7 +224,7 @@ GitHub oficial: https://github.com/ollama/ollama
    TELEGRAM_AI_ENABLED=true
    OLLAMA_BASE_URL=http://127.0.0.1:11434
    OLLAMA_MODEL=qwen2.5:3b
-   OLLAMA_TIMEOUT_SECONDS=45
+   OLLAMA_TIMEOUT_SECONDS=90
    TELEGRAM_AI_MAX_CONTEXT=12
    ```
 4. Reinicie a API (`python run_api.py`)
@@ -292,6 +292,74 @@ O sistema classifica automaticamente em 13 categorias:
 | **matplotlib** | Gráficos e charts |
 | **reportlab** | Geração de PDFs |
 | **ofxparse** | Leitura de arquivos OFX |
+
+---
+
+## 🚢 Produção e Deploy
+
+### Execução recomendada
+
+Para uso local completo (API + GUI):
+
+```bash
+python run_tudo.py
+```
+
+Para servidor (somente API):
+
+```bash
+python run_api.py
+```
+
+### Ambiente de produção
+
+- Use PostgreSQL (evitar SQLite em cenários com múltiplos usuários).
+- Armazene segredos em cofre/secret manager (não em código).
+- Rode API atrás de proxy reverso (Nginx/Caddy) com HTTPS.
+- Separe logs de aplicação e monitoramento de saúde.
+
+---
+
+## 👥 Uso em Grupo no Telegram
+
+Sim, você pode usar em grupos, com as seguintes observações:
+
+- O bot precisa ser adicionado ao grupo.
+- Para captura total de mensagens no grupo, ajuste o Privacy Mode no BotFather conforme estratégia do produto.
+- O ideal é operar por comandos explícitos (ex: /resumo, /lancar, /ajuda), para reduzir ruído.
+- Em grupos de empresa, adote política de permissões por papel (admin, gestor, colaborador).
+
+Sugestão prática para escalar com segurança:
+
+- Cada empresa com um identificador de organização.
+- Cada usuário associado a uma organização e perfil de acesso.
+- Cada chat/grupo Telegram vinculado a uma organização.
+
+---
+
+## 🏢 Escala Multiempresa (Plano)
+
+Para usar o mesmo sistema em várias empresas, o próximo passo é multi-tenant.
+
+### Fase 1: Estrutura de contas
+
+- Criar entidades `organizacoes`, `usuarios`, `membros_organizacao`.
+- Incluir `organizacao_id` nas tabelas de domínio (transações, metas, orçamentos etc.).
+- Restringir todas as consultas por `organizacao_id`.
+
+### Fase 2: Telegram multiempresa
+
+- Mapear `chat_id` -> `organizacao_id`.
+- Comandos administrativos para vincular/desvincular grupos.
+- Isolar contexto de conversa por organização e por chat.
+
+### Fase 3: Governança e operação
+
+- Papéis e permissões (RBAC).
+- Auditoria de ações sensíveis.
+- Limites por organização e observabilidade (métricas/alertas).
+
+Roadmap detalhado: veja `docs/ROADMAP_ESCALA.md`.
 
 ---
 
