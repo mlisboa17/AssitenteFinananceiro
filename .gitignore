@@ -1,0 +1,28 @@
+# Dependências
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Variáveis de ambiente (contém segredos!)
+.env
+*.env
+
+# Banco de dados local
+*.db
+*.sqlite
+
+# Uploads e exports
+assistente_financeiro/uploads/
+assistente_financeiro/exports/
+
+# VS Code
+.vscode/
+
+# Histórico local
+.history/
+
+# Logs e artefatos locais
+*.log
+crash_log.txt
+.pytest_cache/
