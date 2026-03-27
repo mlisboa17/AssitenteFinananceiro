@@ -43,9 +43,90 @@ class TipoExtrato(str, enum.Enum):
     MANUAL   = "manual"
 
 
+class PapelMembro(str, enum.Enum):
+    """Papel do usuário dentro da organização."""
+    OWNER  = "owner"
+    ADMIN  = "admin"
+    EDITOR = "editor"
+    VIEWER = "viewer"
+
+
 # ================================================
 # Modelos
 # ================================================
+
+class Organizacao(Base):
+    """Organização/empresa dona dos dados (tenant)."""
+    __tablename__ = "organizacoes"
+
+    id        = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    nome      = Column(String(120), nullable=False)
+    slug      = Column(String(120), nullable=False, unique=True, index=True)
+    ativa     = Column(Boolean, default=True)
+    criado_em = Column(DateTime, default=datetime.utcnow)
+
+    def __repr__(self):
+        return f"<Organizacao(id={self.id}, nome='{self.nome}')>"
+
+
+class Usuario(Base):
+    """Usuário da plataforma (pessoa física associada a uma ou mais organizações)."""
+    __tablename__ = "usuarios"
+
+    id                = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    nome              = Column(String(120), nullable=False)
+    email             = Column(String(180), nullable=True, unique=True, index=True)
+    telegram_user_id  = Column(String(64), nullable=True, unique=True, index=True)
+    ativo             = Column(Boolean, default=True)
+    criado_em         = Column(DateTime, default=datetime.utcnow)
+
+    def __repr__(self):
+        return f"<Usuario(id={self.id}, nome='{self.nome}')>"
+
+
+class MembroOrganizacao(Base):
+    """Vínculo N:N entre usuário e organização com papel de acesso."""
+    __tablename__ = "membros_organizacao"
+    __table_args__ = (
+        UniqueConstraint("usuario_id", "organizacao_id", name="uq_membro_usuario_org"),
+    )
+
+    id              = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    usuario_id      = Column(Integer, ForeignKey("usuarios.id"), nullable=False, index=True)
+    organizacao_id  = Column(Integer, ForeignKey("organizacoes.id"), nullable=False, index=True)
+    papel           = Column(SAEnum(PapelMembro), nullable=False, default=PapelMembro.OWNER)
+    ativo           = Column(Boolean, default=True)
+    criado_em       = Column(DateTime, default=datetime.utcnow)
+
+    usuario         = relationship("Usuario")
+    organizacao     = relationship("Organizacao")
+
+    def __repr__(self):
+        return (
+            f"<MembroOrganizacao(id={self.id}, usuario_id={self.usuario_id}, "
+            f"organizacao_id={self.organizacao_id}, papel='{self.papel}')>"
+        )
+
+
+class TelegramChat(Base):
+    """Mapeia chats do Telegram (privado/grupo) para uma organização."""
+    __tablename__ = "telegram_chats"
+
+    id                    = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    chat_id               = Column(String(64), nullable=False, unique=True, index=True)
+    tipo_chat             = Column(String(32), nullable=False, default="private")
+    titulo                = Column(String(180), nullable=True)
+    organizacao_id        = Column(Integer, ForeignKey("organizacoes.id"), nullable=False, index=True)
+    usuario_vinculador_id = Column(Integer, ForeignKey("usuarios.id"), nullable=True, index=True)
+    ativo                 = Column(Boolean, default=True)
+    criado_em             = Column(DateTime, default=datetime.utcnow)
+    atualizado_em         = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    organizacao           = relationship("Organizacao")
+    usuario_vinculador    = relationship("Usuario")
+
+    def __repr__(self):
+        return f"<TelegramChat(chat_id='{self.chat_id}', org_id={self.organizacao_id}, ativo={self.ativo})>"
 
 class Categoria(Base):
     """
@@ -55,6 +136,7 @@ class Categoria(Base):
     __tablename__ = "categorias"
 
     id        = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    organizacao_id = Column(Integer, ForeignKey("organizacoes.id"), nullable=True, default=1, index=True)
     nome      = Column(String(100), unique=True, nullable=False, index=True)
     cor       = Column(String(7),  default="#3498db")   # Cor hexadecimal para gráficos
     icone     = Column(String(10), default="💰")         # Emoji de ícone
@@ -79,6 +161,7 @@ class ContaBancaria(Base):
     __tablename__ = "contas_bancarias"
 
     id        = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    organizacao_id = Column(Integer, ForeignKey("organizacoes.id"), nullable=True, default=1, index=True)
     nome      = Column(String(100), nullable=False)         # Ex: "Conta Corrente Itaú"
     banco     = Column(String(100), nullable=False)         # Ex: "Itaú"
     agencia   = Column(String(20),  nullable=True)
@@ -102,6 +185,7 @@ class CartaoCredito(Base):
     __tablename__ = "cartoes_credito"
 
     id                = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    organizacao_id    = Column(Integer, ForeignKey("organizacoes.id"), nullable=True, default=1, index=True)
     nome              = Column(String(100), nullable=False)     # Ex: "Nubank Mastercard"
     bandeira          = Column(String(50),  nullable=False)     # Ex: "Mastercard"
     limite            = Column(Float,       default=0.0)
@@ -127,6 +211,7 @@ class Transacao(Base):
     __tablename__ = "transacoes"
 
     id             = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    organizacao_id = Column(Integer, ForeignKey("organizacoes.id"), nullable=True, default=1, index=True)
     data           = Column(Date,    nullable=False, index=True)
     descricao      = Column(String(255), nullable=False)
     valor          = Column(Float,       nullable=False)
@@ -169,6 +254,7 @@ class Extrato(Base):
     __tablename__ = "extratos"
 
     id                = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    organizacao_id     = Column(Integer, ForeignKey("organizacoes.id"), nullable=True, default=1, index=True)
     arquivo_nome      = Column(String(255), nullable=False)
     arquivo_path      = Column(String(512), nullable=True)
     tipo              = Column(SAEnum(TipoExtrato), nullable=False)
@@ -223,6 +309,7 @@ class Meta(Base):
     __tablename__ = "metas"
 
     id           = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    organizacao_id = Column(Integer, ForeignKey("organizacoes.id"), nullable=True, default=1, index=True)
     nome         = Column(String(100), nullable=False)
     descricao    = Column(Text,    nullable=True)
     valor_alvo   = Column(Float,   nullable=False)
@@ -256,6 +343,7 @@ class Orcamento(Base):
     __tablename__ = "orcamentos"
 
     id                = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    organizacao_id     = Column(Integer, ForeignKey("organizacoes.id"), nullable=True, default=1, index=True)
     valor_limite      = Column(Float,   nullable=False)
     mes               = Column(Integer, nullable=False)         # 1 = Janeiro, 12 = Dezembro
     ano               = Column(Integer, nullable=False)
@@ -297,6 +385,7 @@ class EventoFinanceiro(Base):
     __tablename__ = "eventos_financeiros"
 
     id               = Column(Integer,  primary_key=True, index=True, autoincrement=True)
+    organizacao_id    = Column(Integer, ForeignKey("organizacoes.id"), nullable=True, default=1, index=True)
     titulo           = Column(String(150), nullable=False)
     descricao        = Column(Text,     nullable=True)
     valor            = Column(Float,    nullable=False, default=0.0)
@@ -327,6 +416,7 @@ class Compromisso(Base):
     __tablename__ = "compromissos"
 
     id               = Column(Integer,  primary_key=True, index=True, autoincrement=True)
+    organizacao_id    = Column(Integer, ForeignKey("organizacoes.id"), nullable=True, default=1, index=True)
     titulo           = Column(String(150), nullable=False)
     descricao        = Column(Text,     nullable=True)
     local            = Column(String(200), nullable=True)
@@ -373,9 +463,13 @@ class TarefaPlanner(Base):
     __tablename__ = "tarefas_planner"
 
     id           = Column(Integer,  primary_key=True, index=True, autoincrement=True)
+    organizacao_id = Column(Integer, ForeignKey("organizacoes.id"), nullable=True, default=1, index=True)
     titulo       = Column(String(150), nullable=False)
     descricao    = Column(Text,     nullable=True)
     data         = Column(Date,     nullable=True, index=True)
+    hora_inicio  = Column(String(5), nullable=True)   # "HH:MM"
+    hora_fim     = Column(String(5), nullable=True)   # "HH:MM"
+    duracao_min  = Column(Integer, nullable=True)     # alternativa ao fim fixo
     prioridade   = Column(SAEnum(PrioridadeTarefa), nullable=False, default=PrioridadeTarefa.MEDIA)
     status       = Column(SAEnum(StatusTarefa),     nullable=False, default=StatusTarefa.A_FAZER)
     area         = Column(SAEnum(AreaTarefa),        nullable=False, default=AreaTarefa.PESSOAL)

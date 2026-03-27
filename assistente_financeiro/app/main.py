@@ -54,7 +54,7 @@ import concurrent.futures
 import re
 import unicodedata
 from contextlib import asynccontextmanager
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 from uuid import uuid4
@@ -72,7 +72,9 @@ from sqlalchemy import extract
 from app.database import get_db, criar_tabelas
 from app import models, schemas
 from app.models import (
-    Transacao, Categoria, ContaBancaria, CartaoCredito, Extrato, Meta, Orcamento
+    Transacao, Categoria, ContaBancaria, CartaoCredito, Extrato, Meta, Orcamento,
+    EventoFinanceiro, Compromisso, TarefaPlanner, StatusEvento, StatusTarefa,
+    TelegramChat, Organizacao,
 )
 from app.schemas import (
     TransacaoCreate, TransacaoUpdate, TransacaoRead,
@@ -100,7 +102,10 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 _TELEGRAM_WORKER_STARTED = False
+_AGENDA_REMINDER_WORKER_STARTED = False
 _TELEGRAM_PENDENCIAS: Dict[str, Dict[str, Any]] = {}
+_AGENDA_LEMBRETES_ENVIADOS: set[str] = set()
+_AGENDA_LEMBRETES_LOCK = threading.Lock()
 _TELEGRAM_TIPOS_DOCUMENTO: List[tuple[str, str]] = [
     ("comprovante_pagamento_bancario", "Comprovante Bancário (PIX/Transferência)"),
     ("recibo_despesa", "Recibo de Despesa"),
@@ -168,6 +173,7 @@ async def lifespan(_app: FastAPI):
     criar_tabelas()
     _popular_categorias_padrao()
     _iniciar_worker_telegram_polling()
+    _iniciar_worker_lembretes_agenda()
     logger.info("✅ Assistente Financeiro iniciado com sucesso!")
     yield
 
@@ -204,11 +210,109 @@ def _normalizar_bool_env(valor: Optional[str], padrao: bool = True) -> bool:
     return valor.strip().lower() in {"1", "true", "yes", "sim", "on"}
 
 
+def _obter_org_id_chat(chat_id: str) -> Optional[int]:
+    from app.database import SessionLocal
+
+    db = SessionLocal()
+    try:
+        chat = (
+            db.query(TelegramChat)
+            .filter(TelegramChat.chat_id == str(chat_id).strip(), TelegramChat.ativo == True)  # noqa: E712
+            .first()
+        )
+        return int(chat.organizacao_id) if chat and chat.organizacao_id is not None else None
+    finally:
+        db.close()
+
+
+def _obter_org_padrao_id(db: Session) -> Optional[int]:
+    org = db.query(Organizacao).order_by(Organizacao.id.asc()).first()
+    return int(org.id) if org else None
+
+
+def _registrar_chat_telegram_se_necessario(
+    chat_id: str,
+    msg: Any,
+    permitir_auto_bind: bool,
+) -> bool:
+    """Garante que o chat atual esteja mapeado para uma organização."""
+    from app.database import SessionLocal
+
+    chat_id_norm = str(chat_id).strip()
+    if not chat_id_norm:
+        return False
+
+    db = SessionLocal()
+    try:
+        atual = (
+            db.query(TelegramChat)
+            .filter(TelegramChat.chat_id == chat_id_norm)
+            .first()
+        )
+        if atual:
+            if not atual.ativo:
+                atual.ativo = True
+                db.commit()
+            return True
+
+        if not permitir_auto_bind:
+            return False
+
+        org_id = _obter_org_padrao_id(db)
+        if org_id is None:
+            return False
+
+        chat_obj = getattr(msg, "chat", None)
+        tipo_chat = str(getattr(chat_obj, "type", "private") or "private")
+        titulo = str(getattr(chat_obj, "title", "") or "").strip() or None
+
+        novo = TelegramChat(
+            chat_id=chat_id_norm,
+            tipo_chat=tipo_chat,
+            titulo=titulo,
+            organizacao_id=org_id,
+            ativo=True,
+        )
+        db.add(novo)
+        db.commit()
+        return True
+    except Exception:
+        db.rollback()
+        logger.exception("Falha ao registrar chat Telegram para organização.")
+        return False
+    finally:
+        db.close()
+
+
+def _chat_telegram_autorizado(svc: TelegramService, chat_id: str, msg: Optional[Any] = None) -> bool:
+    """
+    Regras:
+    1) Chat fixo do .env sempre permitido.
+    2) Chats mapeados em telegram_chats permitidos.
+    3) Se TELEGRAM_ALLOW_AUTO_BIND=true, novos chats são vinculados automaticamente
+       à organização padrão.
+    """
+    chat_id_norm = str(chat_id).strip()
+    if not chat_id_norm:
+        return False
+
+    if svc.chat_id and str(svc.chat_id).strip() == chat_id_norm:
+        return True
+
+    permitir_auto_bind = _normalizar_bool_env(os.getenv("TELEGRAM_ALLOW_AUTO_BIND"), padrao=True)
+    return _registrar_chat_telegram_se_necessario(
+        chat_id=chat_id_norm,
+        msg=msg,
+        permitir_auto_bind=permitir_auto_bind,
+    )
+
+
 def _processar_texto_telegram(
     svc: TelegramService,
     chat_id: str,
     texto: str,
     loop: asyncio.AbstractEventLoop,
+    msg: Optional[Any] = None,
 ) -> None:
     """Processa texto recebido no Telegram e responde com confirmação."""
     texto = (texto or "").strip()
@@ -216,7 +320,7 @@ def _processar_texto_telegram(
         return
 
     # Se chat fixo estiver configurado, ignora mensagens de outros chats.
-    if svc.chat_id and str(svc.chat_id).strip() and str(svc.chat_id).strip() != str(chat_id).strip():
+    if not _chat_telegram_autorizado(svc, chat_id, msg=msg):
         return
 
     if texto.lower() in {"/start", "/help", "ajuda"}:
@@ -844,8 +948,8 @@ def _processar_arquivo_telegram(
     msg: Any,
     loop: asyncio.AbstractEventLoop,
 ) -> None:
-    # Se chat fixo estiver configurado, ignora mensagens de outros chats.
-    if svc.chat_id and str(svc.chat_id).strip() and str(svc.chat_id).strip() != str(chat_id).strip():
+    # Valida autorização do chat e faz auto-vínculo quando habilitado.
+    if not _chat_telegram_autorizado(svc, chat_id, msg=msg):
         return
 
     file_id = None
@@ -954,6 +1058,7 @@ def _salvar_transacao_telegram(
             valor=abs(float(comando.get("valor", 0))),
             tipo="debito",
             fonte="telegram",
+            organizacao_id=_obter_org_id_chat(chat_id) or 1,
         )
         ClassifierService(db).classificar_e_aplicar(transacao)
 
@@ -981,6 +1086,216 @@ def _salvar_transacao_telegram(
         )
     finally:
         db.close()
+
+
+def _iniciar_worker_lembretes_agenda() -> None:
+    """Inicia worker que envia lembretes de agenda financeira, compromissos e planner."""
+    global _AGENDA_REMINDER_WORKER_STARTED
+
+    if _AGENDA_REMINDER_WORKER_STARTED:
+        return
+
+    if not _normalizar_bool_env(os.getenv("TELEGRAM_AGENDA_REMINDERS_ENABLED"), padrao=True):
+        logger.info("Lembretes Telegram desativados por TELEGRAM_AGENDA_REMINDERS_ENABLED.")
+        return
+
+    svc = TelegramService()
+    st = svc.status()
+    if not st.get("ativo"):
+        logger.info("Telegram sem token ativo; worker de lembretes não iniciado.")
+        return
+
+    intervalo_seg = max(20, int(os.getenv("TELEGRAM_AGENDA_POLL_SECONDS", "60")))
+    janela_min = max(5, int(os.getenv("TELEGRAM_AGENDA_JANELA_MIN", "15")))
+    compromisso_padrao_min = max(1, int(os.getenv("TELEGRAM_COMPROMISSO_LEMBRETE_PADRAO_MIN", "60")))
+    evento_antecedencia_h = max(1, int(os.getenv("TELEGRAM_EVENTO_ANTECEDENCIA_HORAS", "24")))
+    planner_hora = min(23, max(0, int(os.getenv("TELEGRAM_PLANNER_LEMBRETE_HORA", "8"))))
+
+    def _chave(kind: str, item_id: int, when: datetime) -> str:
+        return f"{kind}:{item_id}:{when.strftime('%Y%m%d%H%M')}"
+
+    def _janela_inclui(agora: datetime, alvo: datetime) -> bool:
+        inicio = agora - timedelta(minutes=janela_min)
+        fim = agora + timedelta(minutes=janela_min)
+        return inicio <= alvo <= fim
+
+    def _enviar_se_novo(
+        loop: asyncio.AbstractEventLoop,
+        chat_destino: str,
+        chave: str,
+        texto: str,
+    ) -> None:
+        chave_global = f"{chat_destino}:{chave}"
+        with _AGENDA_LEMBRETES_LOCK:
+            if chave_global in _AGENDA_LEMBRETES_ENVIADOS:
+                return
+            _AGENDA_LEMBRETES_ENVIADOS.add(chave_global)
+
+        enviado = loop.run_until_complete(svc.enviar_mensagem(texto, chat_id=chat_destino))
+        if not enviado:
+            with _AGENDA_LEMBRETES_LOCK:
+                _AGENDA_LEMBRETES_ENVIADOS.discard(chave_global)
+
+    def _destinos_por_org(db: Session) -> List[tuple[str, Optional[int]]]:
+        chats = (
+            db.query(TelegramChat)
+            .filter(TelegramChat.ativo == True)  # noqa: E712
+            .all()
+        )
+        if chats:
+            return [(str(c.chat_id), int(c.organizacao_id) if c.organizacao_id is not None else None) for c in chats]
+
+        if svc.chat_id and str(svc.chat_id).strip():
+            org_padrao = _obter_org_padrao_id(db)
+            return [(str(svc.chat_id).strip(), org_padrao)]
+
+        return []
+
+    def _hora_compromisso(hora_txt: Optional[str]) -> tuple[int, int]:
+        if not hora_txt:
+            return 9, 0
+        try:
+            hora, minuto = hora_txt.strip().split(":")
+            h = min(23, max(0, int(hora)))
+            m = min(59, max(0, int(minuto)))
+            return h, m
+        except Exception:
+            return 9, 0
+
+    def _loop_lembretes() -> None:
+        from app.database import SessionLocal
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        logger.info("🔔 Worker de lembretes da agenda iniciado.")
+
+        while True:
+            db = SessionLocal()
+            try:
+                agora = datetime.now()
+
+                for chat_destino, org_id in _destinos_por_org(db):
+                    # Agenda financeira: lembrete antecipado e no vencimento.
+                    q_eventos = (
+                        db.query(EventoFinanceiro)
+                        .filter(
+                            EventoFinanceiro.status.in_([StatusEvento.PENDENTE, StatusEvento.ATRASADO]),
+                            EventoFinanceiro.data_vencimento >= (agora.date() - timedelta(days=1)),
+                            EventoFinanceiro.data_vencimento <= (agora.date() + timedelta(days=2)),
+                        )
+                    )
+                    if org_id is not None:
+                        q_eventos = q_eventos.filter(EventoFinanceiro.organizacao_id == org_id)
+
+                    for ev in q_eventos.all():
+                        vencimento = datetime.combine(ev.data_vencimento, datetime.min.time().replace(hour=9, minute=0))
+                        lembrete_antes = vencimento - timedelta(hours=evento_antecedencia_h)
+
+                        if _janela_inclui(agora, lembrete_antes):
+                            chave = _chave("evento_pre", ev.id, lembrete_antes)
+                            texto = (
+                                f"🔔 Lembrete financeiro: '{ev.titulo}' vence em breve.\n"
+                                f"📅 Vencimento: {ev.data_vencimento.strftime('%d/%m/%Y')}\n"
+                                f"💵 Valor: {_formatar_valor_br(ev.valor)}"
+                            )
+                            _enviar_se_novo(loop, chat_destino, chave, texto)
+
+                        if _janela_inclui(agora, vencimento):
+                            chave = _chave("evento_due", ev.id, vencimento)
+                            texto = (
+                                f"⚠️ Evento financeiro para hoje: '{ev.titulo}'.\n"
+                                f"📅 Data: {ev.data_vencimento.strftime('%d/%m/%Y')}\n"
+                                f"💵 Valor: {_formatar_valor_br(ev.valor)}"
+                            )
+                            _enviar_se_novo(loop, chat_destino, chave, texto)
+
+                    # Compromissos: usa lembrete_min do item ou fallback padrão.
+                    q_comp = (
+                        db.query(Compromisso)
+                        .filter(
+                            Compromisso.concluido == False,  # noqa: E712
+                            Compromisso.data >= (agora.date() - timedelta(days=1)),
+                            Compromisso.data <= (agora.date() + timedelta(days=1)),
+                        )
+                    )
+                    if org_id is not None:
+                        q_comp = q_comp.filter(Compromisso.organizacao_id == org_id)
+
+                    for comp in q_comp.all():
+                        h, m = _hora_compromisso(comp.hora_inicio)
+                        inicio = datetime.combine(comp.data, datetime.min.time().replace(hour=h, minute=m))
+                        lembrete_min = comp.lembrete_min if comp.lembrete_min is not None else compromisso_padrao_min
+                        lembrete = inicio - timedelta(minutes=max(1, int(lembrete_min)))
+
+                        if _janela_inclui(agora, lembrete):
+                            chave = _chave("compromisso", comp.id, lembrete)
+                            horario = comp.hora_inicio or "09:00"
+                            local_txt = f"\n📍 Local: {comp.local}" if comp.local else ""
+                            texto = (
+                                f"🗓️ Lembrete de compromisso: '{comp.titulo}'.\n"
+                                f"📅 Data: {comp.data.strftime('%d/%m/%Y')} às {horario}"
+                                f"{local_txt}"
+                            )
+                            _enviar_se_novo(loop, chat_destino, chave, texto)
+
+                    # Planner: lembra no dia da tarefa, usando hora_inicio quando houver.
+                    q_tarefas = (
+                        db.query(TarefaPlanner)
+                        .filter(
+                            TarefaPlanner.status != StatusTarefa.CONCLUIDO,
+                            TarefaPlanner.data != None,  # noqa: E711
+                            TarefaPlanner.data >= agora.date(),
+                            TarefaPlanner.data <= (agora.date() + timedelta(days=1)),
+                        )
+                    )
+                    if org_id is not None:
+                        q_tarefas = q_tarefas.filter(TarefaPlanner.organizacao_id == org_id)
+
+                    for tarefa in q_tarefas.all():
+                        hora_inicio_tarefa = str(tarefa.hora_inicio or "").strip()
+                        try:
+                            if hora_inicio_tarefa and ":" in hora_inicio_tarefa:
+                                hh, mm = hora_inicio_tarefa.split(":", 1)
+                                hora_ref = min(23, max(0, int(hh)))
+                                min_ref = min(59, max(0, int(mm)))
+                            else:
+                                hora_ref = planner_hora
+                                min_ref = 0
+                        except Exception:
+                            hora_ref = planner_hora
+                            min_ref = 0
+
+                        lembrete = datetime.combine(
+                            tarefa.data,
+                            datetime.min.time().replace(hour=hora_ref, minute=min_ref),
+                        )
+                        if _janela_inclui(agora, lembrete):
+                            chave = _chave("planner", tarefa.id, lembrete)
+                            if tarefa.hora_inicio and tarefa.hora_fim:
+                                horario_txt = f"{tarefa.hora_inicio}-{tarefa.hora_fim}"
+                            elif tarefa.duracao_min:
+                                horario_txt = f"duração estimada: {int(tarefa.duracao_min)} min"
+                            else:
+                                horario_txt = f"início: {hora_ref:02d}:{min_ref:02d}"
+
+                            texto = (
+                                f"✅ Planner do dia: '{tarefa.titulo}'.\n"
+                                f"📅 Data: {tarefa.data.strftime('%d/%m/%Y')}\n"
+                                f"⏱️ Horário: {horario_txt}\n"
+                                f"🏷️ Área: {tarefa.area.value} | Prioridade: {tarefa.prioridade.value}"
+                            )
+                            _enviar_se_novo(loop, chat_destino, chave, texto)
+
+            except Exception:
+                logger.exception("Falha no worker de lembretes da agenda.")
+            finally:
+                db.close()
+
+            time.sleep(intervalo_seg)
+
+    t = threading.Thread(target=_loop_lembretes, daemon=True, name="agenda-reminders")
+    t.start()
+    _AGENDA_REMINDER_WORKER_STARTED = True
 
 
 def _iniciar_worker_telegram_polling() -> None:
@@ -1037,7 +1352,7 @@ def _iniciar_worker_telegram_polling() -> None:
                     if not msg:
                         continue
                     if getattr(msg, "text", None):
-                        _processar_texto_telegram(svc, str(msg.chat_id), str(msg.text), loop)
+                        _processar_texto_telegram(svc, str(msg.chat_id), str(msg.text), loop, msg=msg)
                     elif getattr(msg, "document", None) or getattr(msg, "photo", None):
                         _processar_arquivo_telegram(svc, str(msg.chat_id), msg, loop)
 

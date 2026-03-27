@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import calendar
 from datetime import date, datetime, timedelta
+import re
 from typing import List, Optional, Dict, Any
 
 from sqlalchemy.orm import Session
@@ -200,6 +201,7 @@ def listar_tarefas(db: Session,
 
 
 def criar_tarefa(db: Session, dados: Dict[str, Any]) -> TarefaPlanner:
+    dados = _normalizar_campos_horario_tarefa(dados)
     tarefa = TarefaPlanner(**dados)
     db.add(tarefa)
     db.commit()
@@ -219,7 +221,8 @@ def criar_multiplas_tarefas(
     """
     criadas = []
     for d in datas:
-        t = TarefaPlanner(**{**base, "data": d})
+        payload = _normalizar_campos_horario_tarefa({**base, "data": d})
+        t = TarefaPlanner(**payload)
         db.add(t)
         criadas.append(t)
     db.commit()
@@ -230,6 +233,7 @@ def atualizar_tarefa(db: Session, tarefa_id: int, dados: Dict[str, Any]) -> Opti
     t = db.query(TarefaPlanner).get(tarefa_id)
     if not t:
         return None
+    dados = _normalizar_campos_horario_tarefa(dados)
     for k, v in dados.items():
         setattr(t, k, v)
     db.commit()
@@ -274,3 +278,56 @@ def resumo_semana(db: Session, semana_inicio: date) -> Dict[str, Any]:
             for p in PrioridadeTarefa
         },
     }
+
+
+def _normalizar_campos_horario_tarefa(dados: Dict[str, Any]) -> Dict[str, Any]:
+    """Padroniza hora_inicio/hora_fim/duracao_min para manter consistência no planner."""
+    if not dados:
+        return dados
+
+    payload = dict(dados)
+
+    hi = payload.get("hora_inicio")
+    hf = payload.get("hora_fim")
+    dur = payload.get("duracao_min")
+
+    def _parse_hhmm(valor: Any) -> Optional[tuple[int, int]]:
+        if valor is None:
+            return None
+        texto = str(valor).strip()
+        if not texto:
+            return None
+        if not re.match(r"^\d{2}:\d{2}$", texto):
+            return None
+        h, m = texto.split(":", 1)
+        h_i = int(h)
+        m_i = int(m)
+        if not (0 <= h_i <= 23 and 0 <= m_i <= 59):
+            return None
+        return h_i, m_i
+
+    hi_t = _parse_hhmm(hi)
+    hf_t = _parse_hhmm(hf)
+
+    if dur is not None:
+        try:
+            dur_i = int(dur)
+            payload["duracao_min"] = max(1, dur_i)
+        except Exception:
+            payload["duracao_min"] = None
+
+    if hi_t and hf_t:
+        inicio = hi_t[0] * 60 + hi_t[1]
+        fim = hf_t[0] * 60 + hf_t[1]
+        if fim <= inicio:
+            fim += 24 * 60
+        payload["duracao_min"] = fim - inicio
+    elif hi_t and payload.get("duracao_min"):
+        total = int(payload["duracao_min"])
+        inicio = hi_t[0] * 60 + hi_t[1]
+        fim = (inicio + total) % (24 * 60)
+        payload["hora_fim"] = f"{fim // 60:02d}:{fim % 60:02d}"
+    elif hi_t and not hf_t and payload.get("duracao_min") is None:
+        payload["duracao_min"] = 60
+
+    return payload
