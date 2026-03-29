@@ -33,6 +33,14 @@ class TipoTransacao(str, enum.Enum):
     CREDITO = "credito"
 
 
+class FormaPagamento(str, enum.Enum):
+    """Forma usada para quitar uma despesa."""
+    DINHEIRO = "dinheiro"
+    CARTAO_CREDITO = "cartao_credito"
+    PIX_TRANSFERENCIA = "pix_transferencia"
+    BOLETO_CONTA = "boleto_conta"
+
+
 class TipoExtrato(str, enum.Enum):
     """Tipo/formato do extrato importado."""
     BANCARIO = "bancario"
@@ -217,6 +225,7 @@ class Transacao(Base):
     valor          = Column(Float,       nullable=False)
     tipo           = Column(SAEnum(TipoTransacao), nullable=False)
     observacao     = Column(Text,    nullable=True)
+    forma_pagamento = Column(SAEnum(FormaPagamento), nullable=True)
 
     # Suporte a compras parceladas (ex: "3/10" = parcela 3 de 10)
     parcela_atual  = Column(Integer, nullable=True)
@@ -374,6 +383,7 @@ class TipoEvento(str, enum.Enum):
     RECEITA    = "receita"     # Receita esperada (salário, freelance…)
     RESERVA    = "reserva"     # Transferência / reserva
     PARCELA    = "parcela"     # Parcela de cartão/empréstimo
+    FATURA_CARTAO = "fatura_cartao"
     OUTRO      = "outro"
 
 
@@ -399,7 +409,13 @@ class EventoFinanceiro(Base):
     criado_em        = Column(DateTime, default=datetime.utcnow)
 
     categoria_id     = Column(Integer, ForeignKey("categorias.id"), nullable=True)
+    conta_id         = Column(Integer, ForeignKey("contas_bancarias.id"), nullable=True)
+    cartao_id        = Column(Integer, ForeignKey("cartoes_credito.id"), nullable=True)
+    transacao_id     = Column(Integer, ForeignKey("transacoes.id"), nullable=True)
     categoria        = relationship("Categoria")
+    conta            = relationship("ContaBancaria")
+    cartao           = relationship("CartaoCredito")
+    transacao        = relationship("Transacao")
 
     def __repr__(self):
         return f"<EventoFinanceiro(id={self.id}, titulo='{self.titulo}', venc='{self.data_vencimento}', status='{self.status}')>"
@@ -478,3 +494,85 @@ class TarefaPlanner(Base):
 
     def __repr__(self):
         return f"<TarefaPlanner(id={self.id}, titulo='{self.titulo}', status='{self.status}')>"
+
+
+# ================================================
+# Gamificação
+# ================================================
+
+class PontuacaoUsuario(Base):
+    """
+    Pontos e XP do usuário.
+    Ganha pontos ao concluir tarefas, atingir metas, etc.
+    """
+    __tablename__ = "pontuacoes_usuario"
+
+    id              = Column(Integer,  primary_key=True, index=True, autoincrement=True)
+    organizacao_id  = Column(Integer, ForeignKey("organizacoes.id"), nullable=True, default=1, index=True)
+    pontos_total    = Column(Integer, default=0)
+    xp_total        = Column(Integer, default=0)
+    nivel           = Column(Integer, default=1)
+    xp_proximo_nivel = Column(Integer, default=100)
+    xp_para_nivel   = Column(Integer, default=0)
+    atualizado_em   = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    def __repr__(self):
+        return f"<PontuacaoUsuario(org={self.organizacao_id}, nível={self.nivel}, XP={self.xp_total})>"
+
+
+class Badge(Base):
+    """
+    Conquista/Badge que o usuário pode desbloquear.
+    """
+    __tablename__ = "badges"
+
+    id           = Column(Integer,  primary_key=True, index=True, autoincrement=True)
+    nome         = Column(String(100), nullable=False, unique=True)
+    descricao    = Column(Text,     nullable=True)
+    icone        = Column(String(50), nullable=True)   # emoji ou ícone
+    pontos       = Column(Integer, default=10)
+    xp           = Column(Integer, default=50)
+    criterio     = Column(String(100), nullable=True)  # ex: "tarefas_concluidas_7"
+    criado_em    = Column(DateTime, default=datetime.utcnow)
+
+    def __repr__(self):
+        return f"<Badge(id={self.id}, nome='{self.nome}', pontos={self.pontos})>"
+
+
+class BadgeDesbloqueada(Base):
+    """
+    Registro de badge desbloqueada por um usuário.
+    """
+    __tablename__ = "badges_desbloqueadas"
+
+    id              = Column(Integer,  primary_key=True, index=True, autoincrement=True)
+    organizacao_id  = Column(Integer, ForeignKey("organizacoes.id"), nullable=True, default=1, index=True)
+    badge_id        = Column(Integer, ForeignKey("badges.id"), nullable=False)
+    desbloqueada_em = Column(DateTime, default=datetime.utcnow)
+    
+    badge = relationship("Badge")
+
+    def __repr__(self):
+        return f"<BadgeDesbloqueada(org={self.organizacao_id}, badge={self.badge_id})>"
+
+
+class MetaFinanceiraGamificada(Base):
+    """
+    Meta financeira com gamificação integrada.
+    Quanto mais próximo da meta, mais pontos ganha!
+    """
+    __tablename__ = "metas_gamificadas"
+
+    id              = Column(Integer,  primary_key=True, index=True, autoincrement=True)
+    organizacao_id  = Column(Integer, ForeignKey("organizacoes.id"), nullable=True, default=1, index=True)
+    meta_id         = Column(Integer, ForeignKey("metas.id"), nullable=False)
+    pontos_por_10pct = Column(Integer, default=100)  # Pontos a cada 10% de progresso
+    pontos_ganhos   = Column(Integer, default=0)     # Total de pontos dessa meta
+    badges_desbloq  = Column(Integer, default=0)     # Badges relacionadas
+    concluida       = Column(Boolean, default=False)
+    concluida_em    = Column(DateTime, nullable=True)
+    
+    meta = relationship("Meta")
+
+    def __repr__(self):
+        return f"<MetaFinanceiraGamificada(meta={self.meta_id}, pontos={self.pontos_ganhos})>"

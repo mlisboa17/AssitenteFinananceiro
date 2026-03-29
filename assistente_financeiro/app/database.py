@@ -77,6 +77,7 @@ def criar_tabelas():
     Base.metadata.create_all(bind=engine)
     _garantir_colunas_planner_sqlite()
     _garantir_colunas_multi_tenant_sqlite()
+    _garantir_colunas_pagamento_sqlite()
     _garantir_tenant_padrao_sqlite()
 
 
@@ -124,6 +125,34 @@ def _garantir_colunas_multi_tenant_sqlite() -> None:
             existentes = {str(c[1]).lower() for c in cols}
             if "organizacao_id" not in existentes:
                 conn.execute(text(f"ALTER TABLE {tabela} ADD COLUMN {coluna_ddl}"))
+
+
+def _garantir_colunas_pagamento_sqlite() -> None:
+    """Adiciona colunas novas de pagamento em bases SQLite legadas sem migration formal."""
+    if not DATABASE_URL.startswith("sqlite"):
+        return
+
+    alvos = {
+        "transacoes": {
+            "forma_pagamento": "VARCHAR(32)",
+        },
+        "eventos_financeiros": {
+            "conta_id": "INTEGER",
+            "cartao_id": "INTEGER",
+            "transacao_id": "INTEGER",
+        },
+    }
+
+    with engine.begin() as conn:
+        for tabela, colunas in alvos.items():
+            cols = conn.execute(text(f"PRAGMA table_info({tabela})")).fetchall()
+            if not cols:
+                continue
+
+            existentes = {str(c[1]).lower() for c in cols}
+            for coluna, ddl in colunas.items():
+                if coluna not in existentes:
+                    conn.execute(text(f"ALTER TABLE {tabela} ADD COLUMN {coluna} {ddl}"))
 
 
 def _garantir_tenant_padrao_sqlite() -> None:

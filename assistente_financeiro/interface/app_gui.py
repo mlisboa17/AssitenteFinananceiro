@@ -2,7 +2,7 @@
 Interface Gráfica do Assistente Financeiro Pessoal.
 
 UI moderna e leve construída com CustomTkinter.
-Usa os serviços diretamente (sem depender do servidor API).
+Usa o backend local para operações e respostas do assistente.
 
 Layout:
   ┌────────────┬──────────────────────────────────────┐
@@ -28,9 +28,12 @@ import threading
 import heapq
 import time
 import logging
+import random
 from itertools import count
 from datetime import date, datetime
 from typing import Optional, List, Dict, Any
+from pathlib import Path
+import requests
 
 # Garante que o pacote 'app' seja encontrado ao rodar a interface diretamente
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -39,32 +42,214 @@ import customtkinter as ctk
 from tkinter import ttk, filedialog, messagebox
 import tkinter as tk
 
+try:
+    from CTkMessagebox import CTkMessagebox  # type: ignore
+except Exception:
+    CTkMessagebox = None
+
 # ================================================
 # Configuração visual global
 # ================================================
 ctk.set_appearance_mode("dark")
-ctk.set_default_color_theme("blue")
+ctk.set_default_color_theme("dark-blue")
 
 # Paleta de cores
-COR_PRIMARIA    = "#2E86AB"
-COR_SECUNDARIA  = "#1B4F72"
-COR_SIDEBAR     = "#1A1A2E"
-COR_FUNDO       = "#16213E"
-COR_CARD        = "#0F3460"
-COR_SUCESSO     = "#27AE60"
-COR_PERIGO      = "#E74C3C"
-COR_AVISO       = "#F39C12"
-COR_TEXTO       = "#ECF0F1"
-COR_TEXTO_SUAVE = "#95A5A6"
+COR_PRIMARIA    = "#14B8A6"
+COR_SECUNDARIA  = "#1C2A43"
+COR_SIDEBAR     = "#0D1629"
+COR_FUNDO       = "#090F1D"
+COR_CARD        = "#121C31"
+COR_CARD_ALT    = "#0F1A2E"
+COR_SUCESSO     = "#22C55E"
+COR_PERIGO      = "#F87171"
+COR_AVISO       = "#FBBF24"
+COR_TEXTO       = "#E6EDF7"
+COR_TEXTO_SUAVE = "#9FB3C8"
+COR_BORDA       = "#263A5A"
+COR_DESTAQUE    = "#38BDF8"
+COR_ACENTO      = "#8B5CF6"
+COR_PRIMARIA_HOVER = "#0D9488"
+COR_SCROLL      = "#27456B"
+COR_SCROLL_HOVER = "#315A8A"
 
 
 logger = logging.getLogger(__name__)
+
+
+_MEMES_GUI_TEMPLATES = [
+    "Saldo em {saldo} e eu aqui fingindo que o carrinho online nao existe.",
+    "Receitas de {receitas}, despesas de {despesas}: a batalha mensal segue intensa.",
+    "Com {transacoes} transacoes no periodo, ja da pra abrir uma serie documental.",
+    "Despesas em {despesas}: oficialmente no modo 'foi so um cafezinho'.",
+    "Saldo atual {saldo}. O coracao agradece, o cartao discorda.",
+    "Receitas {receitas} versus despesas {despesas}: quem venceu hoje foi a realidade.",
+    "Com {transacoes} lancamentos, o extrato esta mais movimentado que agenda de feriado.",
+    "Saldo {saldo} nunca foi tanto ate o dia em que descobri que 'impulsivo' e meu melhor coach.",
+    "Transacoes registradas: {transacoes}. Remorso registrado: infinito.",
+    "Receitas {receitas}, despesas {despesas}. A diferenca e so um numero tentando enganar meu coracao.",
+    "Com saldo de {saldo}, tenho 2 opcoes: economia criativa ou ignorancia financeira bliss.",
+    "{transacoes} movimentacoes este mes. Se fosse um videoclipe, seria uma tragedia em 4K.",
+    "Despesas chegaram em {despesas}. Os boletos chegam toda segunda rindo da minha cara.",
+    "Receitas em {receitas}. Que pena que a fatura do mes eh um numero maior (spoiler: nao eh verdade).",
+    "Saldo positivo de {saldo}? Aproveita que quando acordar mudou novamente.",
+]
+
+
+def _habilitar_dialogos_modernos() -> None:
+    """Substitui tkinter.messagebox por CTkMessagebox quando disponível.
+
+    Mantém a assinatura básica usada no projeto e cai para o comportamento
+    padrão caso a biblioteca não esteja instalada.
+    """
+    if CTkMessagebox is None:
+        return
+
+    _tk_showinfo = messagebox.showinfo
+    _tk_showwarning = messagebox.showwarning
+    _tk_showerror = messagebox.showerror
+    _tk_askyesno = messagebox.askyesno
+
+    def _showinfo(title, msg, **kwargs):
+        try:
+            CTkMessagebox(title=str(title), message=str(msg), icon="info", option_1="OK")
+            return "ok"
+        except Exception:
+            return _tk_showinfo(title, msg, **kwargs)
+
+    def _showwarning(title, msg, **kwargs):
+        try:
+            CTkMessagebox(title=str(title), message=str(msg), icon="warning", option_1="OK")
+            return "ok"
+        except Exception:
+            return _tk_showwarning(title, msg, **kwargs)
+
+    def _showerror(title, msg, **kwargs):
+        try:
+            CTkMessagebox(title=str(title), message=str(msg), icon="cancel", option_1="OK")
+            return "ok"
+        except Exception:
+            return _tk_showerror(title, msg, **kwargs)
+
+    def _askyesno(title, msg, **kwargs):
+        try:
+            dlg = CTkMessagebox(
+                title=str(title),
+                message=str(msg),
+                icon="question",
+                option_1="Não",
+                option_2="Sim",
+            )
+            return str(dlg.get()).strip().lower() == "sim"
+        except Exception:
+            return _tk_askyesno(title, msg, **kwargs)
+
+    messagebox.showinfo = _showinfo
+    messagebox.showwarning = _showwarning
+    messagebox.showerror = _showerror
+    messagebox.askyesno = _askyesno
+
+
+_habilitar_dialogos_modernos()
 
 
 _UI_HEAP_LOCK = threading.Lock()
 _UI_HEAP = []
 _UI_SEQ = count()
 _UI_ROOT = None
+_LOGO_CACHE: Dict[tuple[int, int], Optional[ctk.CTkImage]] = {}
+
+
+def _resolver_logo_sistema() -> Optional[str]:
+    """Resolve caminho do símbolo principal do sistema.
+
+    Ordem de busca:
+    1) Variáveis de ambiente SISTEMA_LOGO_PATH/LOGO_SISTEMA_PATH
+    2) Pastas assets comuns dentro do projeto
+    3) Sem fallback automático em uploads para evitar usar fotos erradas
+    """
+    base_dir = Path(__file__).resolve().parents[1]          # assistente_financeiro/
+    workspace_dir = base_dir.parent                          # raiz do workspace
+
+    env_candidates = [
+        os.getenv("SISTEMA_LOGO_PATH", "").strip(),
+        os.getenv("LOGO_SISTEMA_PATH", "").strip(),
+    ]
+    for raw in env_candidates:
+        if not raw:
+            continue
+        p = Path(raw)
+        if not p.is_absolute():
+            p = workspace_dir / p
+        if p.exists() and p.is_file():
+            return str(p)
+
+    common_candidates = [
+        base_dir / "assets" / "logo_sistema.png",
+        base_dir / "assets" / "logo_sistema.jpg",
+        base_dir / "assets" / "logo_sistema.jpeg",
+        base_dir / "assets" / "logo_sistema.webp",
+        base_dir / "assets" / "logo.png",
+        base_dir / "assets" / "logos.png",
+        base_dir / "interface" / "assets" / "logo_sistema.png",
+        base_dir / "interface" / "assets" / "logo.png",
+        workspace_dir / "assets" / "logo_sistema.png",
+        workspace_dir / "assets" / "logo.png",
+    ]
+    for p in common_candidates:
+        if p.exists() and p.is_file():
+            return str(p)
+
+    return None
+
+
+def _carregar_logo_ctk(size: tuple[int, int]) -> Optional[ctk.CTkImage]:
+    """Carrega logo como CTkImage com cache; retorna None se indisponível."""
+    if size in _LOGO_CACHE:
+        return _LOGO_CACHE[size]
+
+    caminho = _resolver_logo_sistema()
+    if not caminho:
+        _LOGO_CACHE[size] = None
+        return None
+
+    try:
+        from PIL import Image
+
+        img = Image.open(caminho)
+        ctk_img = ctk.CTkImage(light_image=img, dark_image=img, size=size)
+        _LOGO_CACHE[size] = ctk_img
+        return ctk_img
+    except Exception:
+        logger.exception("Não foi possível carregar logo do sistema em %s", caminho)
+        _LOGO_CACHE[size] = None
+        return None
+
+
+def _criar_marca_logos(parent, *, compacto: bool = False, bg: Optional[str] = None):
+    """Desenha uma marca vetorial simples do LOGOS como fallback visual."""
+    fundo = bg or COR_SIDEBAR
+    frame = ctk.CTkFrame(parent, fg_color="transparent")
+
+    if compacto:
+        canvas = tk.Canvas(frame, width=54, height=28, bg=fundo, highlightthickness=0, bd=0)
+        canvas.pack(side="left")
+        canvas.create_line(6, 15, 26, 5, 48, 15, smooth=True, width=2, fill="#6EE7F9")
+        canvas.create_line(6, 15, 26, 24, 48, 15, smooth=True, width=2, fill="#38BDF8")
+        canvas.create_oval(22, 11, 30, 19, outline="#A78BFA", width=2)
+        canvas.create_oval(24, 13, 28, 17, fill="#38BDF8", outline="#38BDF8")
+        ctk.CTkLabel(frame, text="LOGOS", font=ctk.CTkFont(size=11, weight="bold"), text_color=COR_TEXTO).pack(side="left", padx=(6, 0))
+        return frame
+
+    canvas = tk.Canvas(frame, width=190, height=130, bg=fundo, highlightthickness=0, bd=0)
+    canvas.pack()
+    canvas.create_line(18, 48, 78, 16, 150, 36, smooth=True, width=5, fill="#6EE7F9")
+    canvas.create_line(22, 54, 84, 86, 156, 60, smooth=True, width=5, fill="#38BDF8")
+    canvas.create_arc(56, 28, 124, 88, start=200, extent=320, style="arc", outline="#A78BFA", width=4)
+    canvas.create_oval(74, 40, 106, 72, outline="#6EE7F9", width=3)
+    canvas.create_oval(84, 50, 96, 62, fill="#38BDF8", outline="#38BDF8")
+    canvas.create_text(95, 98, text="LOGOS", fill="#E5E7EB", font=("Segoe UI", 24, "bold"))
+    canvas.create_text(95, 118, text="ECOSSISTEMA DE INTELIGÊNCIA", fill="#94A3B8", font=("Segoe UI", 9, "bold"))
+    return frame
 
 
 def _registrar_dispatch_ui(root):
@@ -175,11 +360,29 @@ class AssistenteFinanceiroApp(ctk.CTk):
     def __init__(self):
         super().__init__()
 
+        screen_w = int(self.winfo_screenwidth() or 1366)
+        screen_h = int(self.winfo_screenheight() or 768)
+        self._ui_compacto = screen_w < 1520 or screen_h < 900
+        self._sidebar_width = 200 if self._ui_compacto else 236
+
+        # Em monitores menores, reduz escala para evitar cortes sem perder legibilidade.
+        if screen_h < 760:
+            ctk.set_widget_scaling(0.90)
+        elif screen_h < 900:
+            ctk.set_widget_scaling(0.95)
+
         _registrar_dispatch_ui(self)
+        self.logo_path = _resolver_logo_sistema()
+        self._logo_sidebar = _carregar_logo_ctk((118, 68) if self._ui_compacto else (146, 84))
+        self._logo_topbar = _carregar_logo_ctk((30, 20) if self._ui_compacto else (36, 24))
 
         self.title("💰 Vorcaro")
-        self.geometry("1280x780")
-        self.minsize(1000, 650)
+        largura = min(1280, max(980, int(screen_w * 0.90)))
+        altura = min(820, max(620, int(screen_h * 0.88)))
+        pos_x = max(0, (screen_w - largura) // 2)
+        pos_y = max(0, (screen_h - altura) // 2)
+        self.geometry(f"{largura}x{altura}+{pos_x}+{pos_y}")
+        self.minsize(860 if self._ui_compacto else 980, 560 if self._ui_compacto else 640)
 
         # Inicializa banco de dados
         self._inicializar_db()
@@ -187,6 +390,8 @@ class AssistenteFinanceiroApp(ctk.CTk):
         # Frame atual
         self._frame_atual: Optional[ctk.CTkFrame] = None
         self._botoes_nav  = {}
+        self._memes_gui_pool: List[str] = []
+        self._ultimo_meme_gui: Optional[str] = None
 
         # Constrói layout principal
         self._construir_layout()
@@ -226,7 +431,14 @@ class AssistenteFinanceiroApp(ctk.CTk):
         self.grid_rowconfigure(0, weight=1)
 
         # Sidebar
-        self.sidebar = ctk.CTkFrame(self, width=220, fg_color=COR_SIDEBAR, corner_radius=0)
+        self.sidebar = ctk.CTkFrame(
+            self,
+            width=self._sidebar_width,
+            fg_color=COR_SIDEBAR,
+            corner_radius=0,
+            border_width=1,
+            border_color=COR_BORDA,
+        )
         self.sidebar.grid(row=0, column=0, sticky="nsew")
         self.sidebar.grid_propagate(False)
         self._construir_sidebar()
@@ -235,35 +447,87 @@ class AssistenteFinanceiroApp(ctk.CTk):
         self.area_conteudo = ctk.CTkFrame(self, fg_color=COR_FUNDO, corner_radius=0)
         self.area_conteudo.grid(row=0, column=1, sticky="nsew", padx=0, pady=0)
         self.area_conteudo.grid_columnconfigure(0, weight=1)
-        self.area_conteudo.grid_rowconfigure(0, weight=1)
+        self.area_conteudo.grid_rowconfigure(1, weight=1)
+
+        topbar = ctk.CTkFrame(
+            self.area_conteudo,
+            fg_color=COR_CARD_ALT,
+            height=44 if self._ui_compacto else 50,
+            corner_radius=0,
+            border_width=1,
+            border_color=COR_BORDA,
+        )
+        topbar.grid(row=0, column=0, sticky="ew")
+        topbar.grid_columnconfigure(1, weight=1)
+
+        if self._logo_topbar is not None:
+            ctk.CTkLabel(topbar, text="", image=self._logo_topbar).grid(row=0, column=0, padx=(12, 8), pady=7, sticky="w")
+        else:
+            _criar_marca_logos(topbar, compacto=True, bg=COR_CARD_ALT).grid(row=0, column=0, padx=(12, 8), pady=7, sticky="w")
+
+        ctk.CTkLabel(
+            topbar,
+            text="LOGOS • Ecossistema de Inteligência",
+            font=ctk.CTkFont(family="Segoe UI", size=12 if self._ui_compacto else 13, weight="bold"),
+            text_color=COR_TEXTO,
+        ).grid(row=0, column=1, sticky="w")
+
+        ctk.CTkLabel(
+            topbar,
+            text="Subsistema ativo: Vorcaro",
+            font=ctk.CTkFont(family="Segoe UI", size=10 if self._ui_compacto else 11),
+            text_color=COR_DESTAQUE,
+        ).grid(row=0, column=2, padx=(8, 12), sticky="e")
 
     def _construir_sidebar(self):
         """Constrói a barra lateral com logo e navegação."""
         # Logo / Título
         logo_frame = ctk.CTkFrame(self.sidebar, fg_color="transparent")
-        logo_frame.pack(pady=(20, 5), padx=15, fill="x")
+        logo_frame.pack(pady=(10, 4), padx=10, fill="x")
+
+        if self._logo_sidebar is not None:
+            ctk.CTkLabel(logo_frame, text="", image=self._logo_sidebar).pack(pady=(0, 4))
+        else:
+            _criar_marca_logos(logo_frame, compacto=False, bg=COR_SIDEBAR).pack(pady=(0, 2))
 
         ctk.CTkLabel(
-            logo_frame, text="💰", font=ctk.CTkFont(size=30)
+            logo_frame, text="Ecossistema Principal",
+            font=ctk.CTkFont(size=10 if self._ui_compacto else 11, weight="bold"),
+            text_color=COR_DESTAQUE,
         ).pack()
         ctk.CTkLabel(
             logo_frame, text="Vorcaro",
-            font=ctk.CTkFont(size=20, weight="bold"),
+            font=ctk.CTkFont(size=13 if self._ui_compacto else 14, weight="bold"),
             text_color=COR_TEXTO,
         ).pack()
+        ctk.CTkLabel(
+            logo_frame, text="Inteligência financeira para decidir melhor.",
+            font=ctk.CTkFont(size=10 if self._ui_compacto else 11),
+            text_color=COR_TEXTO_SUAVE,
+        ).pack(pady=(2, 0))
 
-        ctk.CTkFrame(self.sidebar, height=1, fg_color=COR_SECUNDARIA).pack(fill="x", padx=15, pady=10)
+        ctk.CTkFrame(self.sidebar, height=1, fg_color=COR_BORDA).pack(fill="x", padx=12, pady=8)
 
         # Botão rápido de despesa
         ctk.CTkButton(
             self.sidebar,
             text="➕  Nova Despesa",
             fg_color=COR_SUCESSO,
-            hover_color="#1E8449",
-            font=ctk.CTkFont(size=12, weight="bold"),
+            hover_color="#16A34A",
+            font=ctk.CTkFont(size=11 if self._ui_compacto else 12, weight="bold"),
             command=self._dialog_nova_despesa,
             corner_radius=8,
-        ).pack(padx=15, pady=(0, 12), fill="x")
+            height=32 if self._ui_compacto else 36,
+        ).pack(padx=12, pady=(0, 10), fill="x")
+
+        nav_container = ctk.CTkScrollableFrame(
+            self.sidebar,
+            fg_color="transparent",
+            corner_radius=0,
+            scrollbar_button_color=COR_SCROLL,
+            scrollbar_button_hover_color=COR_SCROLL_HOVER,
+        )
+        nav_container.pack(fill="both", expand=True, padx=8, pady=(0, 6))
 
         # Itens de navegação
         itens_nav = [
@@ -284,29 +548,30 @@ class AssistenteFinanceiroApp(ctk.CTk):
 
         for chave, texto in itens_nav:
             btn = ctk.CTkButton(
-                self.sidebar,
+                nav_container,
                 text=texto,
                 fg_color="transparent",
                 text_color=COR_TEXTO_SUAVE,
-                hover_color="#2C2C54",
+                hover_color=COR_SECUNDARIA,
                 anchor="w",
-                font=ctk.CTkFont(size=13),
+                font=ctk.CTkFont(size=11 if self._ui_compacto else 12, weight="bold"),
                 corner_radius=8,
+                height=28 if self._ui_compacto else 32,
                 command=lambda c=chave: self._navegar(c),
             )
-            btn.pack(padx=10, pady=2, fill="x")
+            btn.pack(padx=4, pady=2, fill="x")
             self._botoes_nav[chave] = btn
 
         # Rodapé sidebar
-        ctk.CTkFrame(self.sidebar, height=1, fg_color=COR_SECUNDARIA).pack(
-            fill="x", padx=15, pady=10, side="bottom"
+        ctk.CTkFrame(self.sidebar, height=1, fg_color=COR_BORDA).pack(
+            fill="x", padx=12, pady=8, side="bottom"
         )
         ctk.CTkLabel(
             self.sidebar,
-            text="v1.0.0 • SQLite",
-            font=ctk.CTkFont(size=10),
+            text="LOGOS Platform • v1.0.0",
+            font=ctk.CTkFont(size=9 if self._ui_compacto else 10),
             text_color=COR_TEXTO_SUAVE,
-        ).pack(side="bottom", pady=5)
+        ).pack(side="bottom", pady=4)
 
     # --------------------------------------------------
     # Navegação
@@ -321,7 +586,7 @@ class AssistenteFinanceiroApp(ctk.CTk):
         # Reseta destaque dos botões
         for chave, btn in self._botoes_nav.items():
             if chave == secao:
-                btn.configure(fg_color=COR_PRIMARIA, text_color="white")
+                btn.configure(fg_color=COR_PRIMARIA, hover_color=COR_PRIMARIA_HOVER, text_color="#F8FAFC")
             else:
                 btn.configure(fg_color="transparent", text_color=COR_TEXTO_SUAVE)
 
@@ -343,7 +608,42 @@ class AssistenteFinanceiroApp(ctk.CTk):
         }
         FrameClass = mapa.get(secao, DashboardFrame)
         self._frame_atual = FrameClass(self.area_conteudo, self)
-        self._frame_atual.grid(row=0, column=0, sticky="nsew", padx=15, pady=15)
+        self._frame_atual.grid(
+            row=1,
+            column=0,
+            sticky="nsew",
+            padx=12 if self._ui_compacto else 16,
+            pady=10 if self._ui_compacto else 14,
+        )
+
+        if hasattr(self._frame_atual, "receber_meme_automatico"):
+            try:
+                self._frame_atual.receber_meme_automatico()
+            except Exception:
+                logger.exception("Falha ao atualizar meme automatico na troca de tela.")
+
+    def proximo_meme_gui(self, contexto: Optional[Dict[str, Any]] = None) -> str:
+        """Retorna um meme em rotação aleatória para uso na GUI."""
+        if not self._memes_gui_pool:
+            self._memes_gui_pool = list(_MEMES_GUI_TEMPLATES)
+            random.shuffle(self._memes_gui_pool)
+            if (
+                self._ultimo_meme_gui
+                and len(self._memes_gui_pool) > 1
+                and self._memes_gui_pool[0] == self._ultimo_meme_gui
+            ):
+                self._memes_gui_pool.append(self._memes_gui_pool.pop(0))
+
+        template = self._memes_gui_pool.pop(0)
+        self._ultimo_meme_gui = template
+
+        ctx = contexto or {}
+        return template.format(
+            receitas=str(ctx.get("receitas", "R$ 0,00")),
+            despesas=str(ctx.get("despesas", "R$ 0,00")),
+            saldo=str(ctx.get("saldo", "R$ 0,00")),
+            transacoes=str(ctx.get("transacoes", "0")),
+        )
 
     # --------------------------------------------------
     # Dialog de nova despesa rápida
@@ -485,7 +785,7 @@ class AssistenteFinanceiroApp(ctk.CTk):
 # Frame: Dashboard
 # ================================================
 
-class DashboardFrame(ctk.CTkFrame):
+class DashboardFrame(ctk.CTkScrollableFrame):
     """Painel principal com resumo financeiro e gráficos."""
 
     def __init__(self, parent, app: AssistenteFinanceiroApp):
@@ -509,21 +809,28 @@ class DashboardFrame(ctk.CTkFrame):
         hoje_fmt = f"{hoje.day} de {_ml[hoje.month]} de {hoje.year}"
 
         # ── Banda superior: saudação + seletor de período ─────────────
-        topo = ctk.CTkFrame(self, fg_color=COR_CARD, corner_radius=14)
+        topo = ctk.CTkFrame(self, fg_color=COR_CARD_ALT, corner_radius=14, border_width=1, border_color=COR_BORDA)
         topo.grid(row=0, column=0, sticky="ew", pady=(0, 14))
         topo.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(
+            topo,
+            text="LOGOS  ➜  Vorcaro",
+            font=ctk.CTkFont(size=10, weight="bold"),
+            text_color=COR_DESTAQUE,
+        ).grid(row=0, column=0, padx=18, pady=(8, 0), sticky="w")
 
         ctk.CTkLabel(
             topo,
             text=f"{saud}  •  {hoje_fmt}",
             font=ctk.CTkFont(size=13),
             text_color=COR_TEXTO_SUAVE,
-        ).grid(row=0, column=0, padx=18, pady=12, sticky="w")
+        ).grid(row=1, column=0, padx=18, pady=(2, 12), sticky="w")
 
         nav = ctk.CTkFrame(topo, fg_color="transparent")
-        nav.grid(row=0, column=1, padx=12, sticky="e")
+        nav.grid(row=0, column=1, rowspan=2, padx=12, sticky="e")
         ctk.CTkButton(nav, text="◀", width=32, height=28,
-                      fg_color=COR_SECUNDARIA, hover_color=COR_PRIMARIA,
+                      fg_color=COR_SECUNDARIA, hover_color=COR_PRIMARIA_HOVER,
                       font=ctk.CTkFont(size=13, weight="bold"),
                       command=self._mes_anterior).pack(side="left", padx=2)
         self.lbl_periodo = ctk.CTkLabel(
@@ -533,7 +840,7 @@ class DashboardFrame(ctk.CTkFrame):
         )
         self.lbl_periodo.pack(side="left", padx=8)
         ctk.CTkButton(nav, text="▶", width=32, height=28,
-                      fg_color=COR_SECUNDARIA, hover_color=COR_PRIMARIA,
+                      fg_color=COR_SECUNDARIA, hover_color=COR_PRIMARIA_HOVER,
                       font=ctk.CTkFont(size=13, weight="bold"),
                       command=self._mes_proximo).pack(side="left", padx=2)
 
@@ -547,30 +854,104 @@ class DashboardFrame(ctk.CTkFrame):
         # ── Cards de resumo ───────────────────────────────────────────
         self.frame_cards = ctk.CTkFrame(self, fg_color="transparent")
         self.frame_cards.grid(row=2, column=0, sticky="ew", pady=(0, 16))
-        for i in range(5):
-            self.frame_cards.grid_columnconfigure(i, weight=1)
+        if self.app._ui_compacto:
+            for i in range(3):
+                self.frame_cards.grid_columnconfigure(i, weight=1)
 
-        self.card_receitas    = self._criar_card(self.frame_cards, "Receitas",           "💵", "R$ 0,00", COR_SUCESSO,  0)
-        self.card_despesas    = self._criar_card(self.frame_cards, "Despesas",           "💸", "R$ 0,00", COR_PERIGO,   1)
-        self.card_saldo       = self._criar_card(self.frame_cards, "Saldo",              "💰", "R$ 0,00", COR_PRIMARIA, 2)
-        self.card_transacoes  = self._criar_card(self.frame_cards, "Transações",         "📋", "0",       COR_AVISO,    3)
-        self.card_vencimentos = self._criar_card(self.frame_cards, "Próx. Vencimentos",  "🗓️", "—",       "#9B59B6",    4)
+            self.card_receitas    = self._criar_card(self.frame_cards, "Receitas",          "💵", "R$ 0,00", COR_SUCESSO, 0, 0)
+            self.card_despesas    = self._criar_card(self.frame_cards, "Despesas",          "💸", "R$ 0,00", COR_PERIGO,  1, 0)
+            self.card_saldo       = self._criar_card(self.frame_cards, "Saldo",             "💰", "R$ 0,00", COR_PRIMARIA,2, 0)
+            self.card_transacoes  = self._criar_card(self.frame_cards, "Transações",        "📋", "0",       COR_AVISO,   0, 1)
+            self.card_vencimentos = self._criar_card(self.frame_cards, "Próx. Vencimentos", "🗓️", "—",       COR_ACENTO,   1, 1)
+        else:
+            for i in range(5):
+                self.frame_cards.grid_columnconfigure(i, weight=1)
+
+            self.card_receitas    = self._criar_card(self.frame_cards, "Receitas",          "💵", "R$ 0,00", COR_SUCESSO, 0, 0)
+            self.card_despesas    = self._criar_card(self.frame_cards, "Despesas",          "💸", "R$ 0,00", COR_PERIGO,  1, 0)
+            self.card_saldo       = self._criar_card(self.frame_cards, "Saldo",             "💰", "R$ 0,00", COR_PRIMARIA,2, 0)
+            self.card_transacoes  = self._criar_card(self.frame_cards, "Transações",        "📋", "0",       COR_AVISO,   3, 0)
+            self.card_vencimentos = self._criar_card(self.frame_cards, "Próx. Vencimentos", "🗓️", "—",       COR_ACENTO,   4, 0)
 
         # ── Gráficos ──────────────────────────────────────────────────
+        self.frame_vorcaro = ctk.CTkFrame(self, fg_color=COR_CARD, corner_radius=14)
+        self.frame_vorcaro.grid(row=3, column=0, sticky="ew", pady=(0, 12))
+        self.frame_vorcaro.grid_columnconfigure(0, weight=1)
+        self.frame_vorcaro.grid_columnconfigure(1, weight=0)
+
+        bloco_texto = ctk.CTkFrame(self.frame_vorcaro, fg_color="transparent")
+        bloco_texto.grid(row=0, column=0, sticky="ew", padx=14, pady=12)
+        bloco_texto.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(
+            bloco_texto,
+            text="🧠 Radar Vorcaro",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            text_color=COR_TEXTO,
+        ).grid(row=0, column=0, sticky="w")
+
+        self.lbl_vorcaro_status = ctk.CTkLabel(
+            bloco_texto,
+            text="Status: analisando seu mês...",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            text_color=COR_PRIMARIA,
+        )
+        self.lbl_vorcaro_status.grid(row=1, column=0, sticky="w", pady=(3, 0))
+
+        self.lbl_vorcaro_recomendacao = ctk.CTkLabel(
+            bloco_texto,
+            text="Em instantes vou trazer sua principal recomendação financeira.",
+            font=ctk.CTkFont(size=11),
+            text_color=COR_TEXTO_SUAVE,
+            wraplength=520 if self.app._ui_compacto else 650,
+            justify="left",
+        )
+        self.lbl_vorcaro_recomendacao.grid(row=2, column=0, sticky="w", pady=(4, 0))
+
+        self.lbl_vorcaro_meme = ctk.CTkLabel(
+            bloco_texto,
+            text="😏 Meme do dia: carregando sarcasmo financeiro...",
+            font=ctk.CTkFont(size=11),
+            text_color=COR_AVISO,
+            wraplength=520 if self.app._ui_compacto else 650,
+            justify="left",
+        )
+        self.lbl_vorcaro_meme.grid(row=3, column=0, sticky="w", pady=(6, 0))
+
+        bloco_acoes = ctk.CTkFrame(self.frame_vorcaro, fg_color="transparent")
+        bloco_acoes.grid(row=0, column=1, sticky="e", padx=14, pady=10)
+        ctk.CTkButton(
+            bloco_acoes,
+            text="Perguntar ao Vorcaro",
+            height=30,
+            fg_color=COR_PRIMARIA,
+            hover_color=COR_PRIMARIA_HOVER,
+            command=self._abrir_assistente,
+        ).pack(pady=(0, 6), fill="x")
+        ctk.CTkButton(
+            bloco_acoes,
+            text="Ver Relatórios",
+            height=30,
+            fg_color=COR_SECUNDARIA,
+            hover_color=COR_PRIMARIA,
+            command=lambda: self.app._navegar("relatorios"),
+        ).pack(fill="x")
+
         self.frame_graficos = ctk.CTkFrame(self, fg_color="transparent")
-        self.frame_graficos.grid(row=3, column=0, sticky="nsew")
+        self.frame_graficos.grid(row=4, column=0, sticky="nsew")
         self.frame_graficos.grid_columnconfigure(0, weight=1)
         self.frame_graficos.grid_columnconfigure(1, weight=1)
-        self.grid_rowconfigure(3, weight=1)
+        self.grid_rowconfigure(4, weight=1)
 
         # ── Insights ──────────────────────────────────────────────────
         self.frame_insights = ctk.CTkScrollableFrame(self, height=110, fg_color="transparent")
-        self.frame_insights.grid(row=4, column=0, sticky="ew", pady=(12, 0))
+        self.frame_insights.grid(row=5, column=0, sticky="ew", pady=(12, 0))
 
-    def _criar_card(self, parent, titulo, emoji, valor, cor, col):
+    def _criar_card(self, parent, titulo, emoji, valor, cor, col, row=0):
         """Card visual com faixa colorida no topo, ícone, título e valor em destaque."""
         card = ctk.CTkFrame(parent, fg_color=COR_CARD, corner_radius=14)
-        card.grid(row=0, column=col, padx=5, sticky="ew")
+        card.configure(border_width=1, border_color=COR_BORDA)
+        card.grid(row=row, column=col, padx=5, pady=5, sticky="ew")
 
         # Faixa colorida no topo
         ctk.CTkFrame(card, fg_color=cor, height=5, corner_radius=0).pack(fill="x")
@@ -635,8 +1016,11 @@ class DashboardFrame(ctk.CTkFrame):
         self.card_transacoes.configure(text=str(dados["total_transacoes"]))
         self.card_vencimentos.configure(
             text=f"{n_venc} pendente{'s' if n_venc != 1 else ''}",
-            text_color=COR_PERIGO if n_venc > 0 else "#9B59B6",
+            text_color=COR_PERIGO if n_venc > 0 else COR_ACENTO,
         )
+
+        self._atualizar_radar_vorcaro(dados, insights, n_venc)
+        self._atualizar_meme_dashboard(dados)
 
         # Gráficos
         self._renderizar_graficos(dados)
@@ -667,6 +1051,64 @@ class DashboardFrame(ctk.CTkFrame):
                 justify="left",
             ).pack(anchor="w", padx=10, pady=6)
 
+    def _atualizar_meme_dashboard(self, dados):
+        from app.utils.helpers import formatar_moeda
+
+        contexto = {
+            "receitas": formatar_moeda(dados.get("total_receitas", 0) or 0),
+            "despesas": formatar_moeda(dados.get("total_despesas", 0) or 0),
+            "saldo": formatar_moeda(dados.get("saldo_mensal", 0) or 0),
+            "transacoes": int(dados.get("total_transacoes", 0) or 0),
+        }
+        self.lbl_vorcaro_meme.configure(text=f"😏 {self.app.proximo_meme_gui(contexto)}")
+
+    def receber_meme_automatico(self):
+        if _widget_existe(self):
+            self.lbl_vorcaro_meme.configure(text=f"😏 {self.app.proximo_meme_gui()}")
+
+    def _atualizar_radar_vorcaro(self, dados, insights, n_venc: int):
+        receitas = float(dados.get("total_receitas", 0) or 0)
+        despesas = float(dados.get("total_despesas", 0) or 0)
+        saldo = float(dados.get("saldo_mensal", 0) or 0)
+
+        comprometimento = (despesas / receitas) if receitas > 0 else 1.0
+        if saldo >= 0 and comprometimento <= 0.75:
+            status_txt = "Status: saudável"
+            status_cor = COR_SUCESSO
+        elif saldo >= 0 and comprometimento <= 1.0:
+            status_txt = "Status: atenção"
+            status_cor = COR_AVISO
+        else:
+            status_txt = "Status: risco"
+            status_cor = COR_PERIGO
+
+        self.lbl_vorcaro_status.configure(
+            text=f"{status_txt}  |  Comprometimento: {comprometimento * 100:.0f}%",
+            text_color=status_cor,
+        )
+
+        sugestao_base = "Revise seus gastos fixos e alinhe suas metas para o próximo ciclo."
+        if insights:
+            item = insights[0]
+            titulo = str(item.get("titulo") or "Sugestão")
+            descricao = str(item.get("descricao") or "")
+            sugestao_base = f"{titulo}: {descricao}".strip()
+        if n_venc > 0:
+            sugestao_base += f" Você tem {n_venc} vencimento(s) próximo(s)."
+
+        self.lbl_vorcaro_recomendacao.configure(text=sugestao_base)
+
+    def _abrir_assistente(self):
+        try:
+            self.app._navegar("assistente")
+            frame = getattr(self.app, "_frame_atual", None)
+            if frame and hasattr(frame, "entry") and hasattr(frame, "_enviar"):
+                frame.entry.delete(0, "end")
+                frame.entry.insert(0, "Me dê um plano de economia para este mês")
+                frame._enviar()
+        except Exception:
+            logger.exception("Não foi possível abrir o assistente a partir do dashboard.")
+
     def _renderizar_graficos(self, dados):
         """Cria gráficos matplotlib dentro do frame."""
         try:
@@ -682,11 +1124,15 @@ class DashboardFrame(ctk.CTkFrame):
             return
 
         plt.style.use("dark_background")
-        BG = "#0F3460"
+        BG = COR_CARD
 
         # ── Rosca: gastos por categoria ───────────────────────────────
         frame_pizza = ctk.CTkFrame(self.frame_graficos, fg_color=COR_CARD, corner_radius=14)
-        frame_pizza.grid(row=0, column=0, padx=(0, 6), sticky="nsew")
+        frame_pizza.configure(border_width=1, border_color=COR_BORDA)
+        if self.app._ui_compacto:
+            frame_pizza.grid(row=0, column=0, padx=0, pady=(0, 10), sticky="nsew")
+        else:
+            frame_pizza.grid(row=0, column=0, padx=(0, 6), sticky="nsew")
         frame_pizza.grid_columnconfigure(0, weight=1)
 
         ctk.CTkLabel(frame_pizza, text="🏷️  Gastos por Categoria",
@@ -694,11 +1140,12 @@ class DashboardFrame(ctk.CTkFrame):
 
         cats = dados.get("categorias_gastos", [])
         if cats:
-            fig_pizza, ax = plt.subplots(figsize=(4.2, 3.0), facecolor=BG)
+            pizza_size = (4.0, 2.8) if self.app._ui_compacto else (4.2, 3.0)
+            fig_pizza, ax = plt.subplots(figsize=pizza_size, facecolor=BG)
             ax.set_facecolor(BG)
             nomes   = [c["categoria"] for c in cats[:6]]
             valores = [c["valor"]     for c in cats[:6]]
-            cores   = ["#2E86AB","#E74C3C","#27AE60","#F39C12","#9B59B6","#1ABC9C"]
+            cores   = [COR_DESTAQUE, COR_PERIGO, COR_SUCESSO, COR_AVISO, COR_ACENTO, COR_PRIMARIA]
             wedges, _, autotexts = ax.pie(
                 valores, labels=None, autopct="%1.0f%%",
                 colors=cores[:len(nomes)], startangle=90,
@@ -720,7 +1167,11 @@ class DashboardFrame(ctk.CTkFrame):
 
         # ── Barras: evolução mensal ───────────────────────────────────
         frame_barras = ctk.CTkFrame(self.frame_graficos, fg_color=COR_CARD, corner_radius=14)
-        frame_barras.grid(row=0, column=1, padx=(6, 0), sticky="nsew")
+        frame_barras.configure(border_width=1, border_color=COR_BORDA)
+        if self.app._ui_compacto:
+            frame_barras.grid(row=1, column=0, padx=0, pady=(0, 4), sticky="nsew")
+        else:
+            frame_barras.grid(row=0, column=1, padx=(6, 0), sticky="nsew")
         frame_barras.grid_columnconfigure(0, weight=1)
 
         ctk.CTkLabel(frame_barras, text="📈  Evolução Mensal",
@@ -728,7 +1179,8 @@ class DashboardFrame(ctk.CTkFrame):
 
         evolucao = dados.get("evolucao_mensal", [])
         if evolucao:
-            fig_ev, ax2 = plt.subplots(figsize=(5.0, 3.0), facecolor=BG)
+            barras_size = (4.8, 2.8) if self.app._ui_compacto else (5.0, 3.0)
+            fig_ev, ax2 = plt.subplots(figsize=barras_size, facecolor=BG)
             ax2.set_facecolor(BG)
             meses    = [e["mes"][:7]  for e in evolucao]
             receitas = [e["receitas"] for e in evolucao]
@@ -736,12 +1188,12 @@ class DashboardFrame(ctk.CTkFrame):
             x        = range(len(meses))
             largura  = 0.35
 
-            ax2.bar([i - largura/2 for i in x], receitas, largura, label="Receitas", color="#27AE60", alpha=0.85)
-            ax2.bar([i + largura/2 for i in x], desp,     largura, label="Despesas", color="#E74C3C", alpha=0.85)
+            ax2.bar([i - largura/2 for i in x], receitas, largura, label="Receitas", color=COR_SUCESSO, alpha=0.88)
+            ax2.bar([i + largura/2 for i in x], desp,     largura, label="Despesas", color=COR_PERIGO, alpha=0.88)
             ax2.set_xticks(list(x))
             ax2.set_xticklabels(meses, rotation=35, ha="right", fontsize=7, color="white")
             ax2.tick_params(colors="white", axis="both")
-            ax2.yaxis.grid(True, color="#1B4F72", linestyle="--", linewidth=0.6, alpha=0.7)
+            ax2.yaxis.grid(True, color=COR_SECUNDARIA, linestyle="--", linewidth=0.6, alpha=0.75)
             ax2.set_axisbelow(True)
             ax2.legend(fontsize=8, labelcolor="white", framealpha=0)
             ax2.spines[:].set_visible(False)
@@ -856,6 +1308,69 @@ def _aplicar_mascara_data(entry: ctk.CTkEntry) -> None:
         inner = entry
 
     inner.bind("<Key>",        _on_key,        add="+")
+    inner.bind("<KeyRelease>", _on_keyrelease, add="+")
+
+
+def _normalizar_hora_hhmm(valor: str) -> str:
+    bruto = (valor or "").strip()
+    if not bruto:
+        return ""
+    if ":" in bruto:
+        hh, mm = bruto.split(":", 1)
+    else:
+        digitos = "".join(ch for ch in bruto if ch.isdigit())
+        if len(digitos) not in {3, 4}:
+            raise ValueError("Hora inválida")
+        hh, mm = digitos[:-2], digitos[-2:]
+    hora = int(hh)
+    minuto = int(mm)
+    if not (0 <= hora <= 23 and 0 <= minuto <= 59):
+        raise ValueError("Hora inválida")
+    return f"{hora:02d}:{minuto:02d}"
+
+
+def _aplicar_mascara_hora(entry: ctk.CTkEntry) -> None:
+    import tkinter as _tk
+
+    def _on_key(event):
+        widget = event.widget
+        if event.keysym in ("BackSpace", "Delete", "Left", "Right", "Home", "End", "Tab"):
+            return
+        if not event.char.isdigit():
+            return "break"
+        try:
+            raw = widget.get().replace(":", "")
+        except Exception:
+            return
+        if len(raw) >= 4:
+            return "break"
+
+    def _on_keyrelease(event):
+        widget = event.widget
+        try:
+            raw = widget.get()
+        except Exception:
+            return
+        digitos = "".join(ch for ch in raw if ch.isdigit())[:4]
+        novo = digitos if len(digitos) < 3 else digitos[:2] + ":" + digitos[2:]
+        if widget.get() != novo:
+            widget.delete(0, _tk.END)
+            widget.insert(0, novo)
+        if len(novo) == 5:
+            try:
+                _normalizar_hora_hhmm(novo)
+                widget.configure(border_color="#27AE60")
+            except Exception:
+                widget.configure(border_color="#E74C3C")
+        else:
+            widget.configure(border_color=("gray75", "gray30"))
+
+    try:
+        inner = entry._entry
+    except AttributeError:
+        inner = entry
+
+    inner.bind("<Key>", _on_key, add="+")
     inner.bind("<KeyRelease>", _on_keyrelease, add="+")
 
 
@@ -4216,8 +4731,9 @@ class AssistenteFrame(ctk.CTkFrame):
     def __init__(self, parent, app):
         super().__init__(parent, fg_color="transparent")
         self.app = app
-        self._gemini = None          # GeminiService (lazy init por sessão)
+        self._assistente_api_url = os.getenv("ASSISTENTE_API_URL", "http://127.0.0.1:8000/assistente/")
         self._pensando = False        # Evita envios duplos durante resposta
+        self._chance_meme_auto = float(os.getenv("GUI_MEME_AUTO_CHANCE", "0.45"))
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(1, weight=1)
         self._construir_ui()
@@ -4297,21 +4813,39 @@ class AssistenteFrame(ctk.CTkFrame):
     def _verificar_api_key(self):
         """Lê a chave da env e atualiza status visual."""
         from dotenv import load_dotenv
+        from app.services.local_ai_service import LocalAIService
+        from app.services.openrouter_service import OpenRouterService
         _env_path = os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"
         )
         load_dotenv(_env_path, override=True)
         key = os.getenv("GEMINI_API_KEY", "")
+        local_ai = LocalAIService()
+        openrouter_ai = OpenRouterService()
         if key and key != "sua_chave_gemini_aqui":
             self.lbl_status_api.configure(text="✅ Gemini ativo", text_color=COR_SUCESSO)
             self.btn_config_api.configure(text="Reconfigurar ⚙️")
             self._exibir_boas_vindas()
+        elif openrouter_ai.disponivel():
+            self.lbl_status_api.configure(text="🟢 OpenRouter free ativo", text_color=COR_SUCESSO)
+            self.btn_config_api.configure(text="Configurar API ⚙️")
+            self._exibir("🤖 Vorcaro", (
+                "Olá! Estou usando fallback online gratuito (OpenRouter) no momento.\n"
+                "Quando o Gemini estiver disponível, ele volta a ser o provedor principal."
+            ), COR_PRIMARIA)
+        elif local_ai.disponivel():
+            self.lbl_status_api.configure(text="🟢 IA local ativa", text_color=COR_SUCESSO)
+            self.btn_config_api.configure(text="Configurar API ⚙️")
+            self._exibir("🤖 Vorcaro", (
+                "Olá! Sou o Vorcaro, seu assistente financeiro pessoal.\n\n"
+                "Estou operando em IA local gratuita (Ollama).\n"
+                "Se você configurar Gemini, uso Gemini e volto para local automaticamente quando houver limite/crédito."
+            ), COR_PRIMARIA)
         else:
             self._exibir("🤖 Vorcaro", (
                 "Olá! Sou o Vorcaro, seu assistente financeiro pessoal.\n\n"
-                "Para começar, configure sua chave de API do Google Gemini clicando em "
-                "\"Configurar API ⚙️\" no canto superior direito.\n\n"
-                "🔑 Obtenha sua chave gratuita em: aistudio.google.com"
+                "Você pode usar Gemini (com fallback automático) ou IA local grátis.\n"
+                "Para modo local, instale Ollama e rode: ollama serve"
             ), COR_PRIMARIA)
 
     def _exibir_boas_vindas(self):
@@ -4381,7 +4915,6 @@ class AssistenteFrame(ctk.CTkFrame):
             )
             _salvar_env_key(env_path, "GEMINI_API_KEY", key)
             os.environ["GEMINI_API_KEY"] = key   # atualiza processo atual
-            self._gemini = None                   # força reinicialização do chat
             self.lbl_status_api.configure(text="✅ Gemini ativo", text_color=COR_SUCESSO)
             self.btn_config_api.configure(text="Reconfigurar ⚙️")
             dlg.destroy()
@@ -4426,49 +4959,52 @@ class AssistenteFrame(ctk.CTkFrame):
         if not q:
             return
 
-        key = os.getenv("GEMINI_API_KEY", "")
-        if not key or key == "sua_chave_gemini_aqui":
-            self._exibir("⚠️ Sistema",
-                         "Configure a chave do Google Gemini primeiro (botão ⚙️ acima).",
-                         COR_AVISO)
-            return
-
         self._exibir("Você", q, COR_AVISO)
         self.entry.delete(0, "end")
         self._set_pensando(True)
         self._exibir("🤖 Vorcaro", "⌛ Pensando...", COR_TEXTO_SUAVE)
 
         def responder():
-            db = self.app._obter_db()
             resposta = ""
+            provedor = ""
             try:
-                # Inicializa ou reutiliza a sessão Gemini
-                if self._gemini is None:
-                    from app.services.gemini_service import GeminiService
-                    self._gemini = GeminiService(api_key=key, db=db)
-
-                resposta = self._gemini.enviar(q)
-
-            except ImportError:
-                resposta = (
-                    "❌ Pacote Google Gemini não instalado.\n"
-                    "Execute no terminal:\n  pip install google-genai"
+                timeout = float(os.getenv("ASSISTENTE_API_TIMEOUT_SECONDS", "70"))
+                resposta_api = requests.post(
+                    self._assistente_api_url,
+                    json={"pergunta": q},
+                    timeout=timeout,
                 )
-                self._gemini = None
+                resposta_api.raise_for_status()
+                dados = resposta_api.json()
+                resposta = str(dados.get("resposta") or "")
+                provedor = str(dados.get("provedor") or "")
+                if not resposta:
+                    resposta = "❌ O backend respondeu sem conteúdo para esta pergunta."
+            except requests.exceptions.Timeout:
+                resposta = (
+                    "❌ O assistente excedeu o tempo limite de resposta.\n"
+                    "Verifique se a API está ativa e se o provedor configurado está respondendo."
+                )
+                provedor = "erro"
+            except requests.exceptions.ConnectionError:
+                resposta = (
+                    "❌ Não foi possível conectar ao backend do assistente.\n"
+                    "Inicie a API local antes de usar o Vorcaro na GUI."
+                )
+                provedor = "erro"
+            except requests.exceptions.HTTPError as exc:
+                try:
+                    detalhe = exc.response.json()
+                except ValueError:
+                    detalhe = exc.response.text if exc.response is not None else str(exc)
+                resposta = f"❌ O backend retornou um erro: {detalhe}"
+                provedor = "erro"
             except Exception as exc:
-                msg = str(exc)
-                if "API_KEY" in msg.upper() or "invalid" in msg.lower():
-                    resposta = "❌ Chave de API inválida. Verifique em Configurar API ⚙️."
-                    self._gemini = None
-                elif "quota" in msg.lower() or "rate" in msg.lower():
-                    resposta = "⏳ Limite de requisições atingido. Aguarde um momento e tente novamente."
-                else:
-                    resposta = f"❌ Erro ao consultar Gemini: {exc}"
-                    self._gemini = None
-            finally:
-                db.close()
+                resposta = f"❌ Falha ao consultar o assistente: {exc}"
+                provedor = "erro"
 
             def _atualizar():
+                texto_resposta = resposta
                 # Remove o "⌛ Pensando..." e exibe resposta real
                 self.chat.configure(state="normal")
                 idx = self.chat.search("⌛ Pensando...", "1.0", "end")
@@ -4479,12 +5015,34 @@ class AssistenteFrame(ctk.CTkFrame):
                     self.chat.delete(line_start, line_end)
                 self.chat.configure(state="disabled")
 
-                self._exibir("🤖 Vorcaro", resposta, COR_PRIMARIA)
+                if provedor == "openrouter_free":
+                    texto_resposta = "ℹ️ Usando IA secundária (OpenRouter free).\n\n" + texto_resposta
+                elif provedor == "ollama_local":
+                    texto_resposta = "ℹ️ Usando IA secundária local (Ollama).\n\n" + texto_resposta
+
+                if provedor == "gemini":
+                    self.lbl_status_api.configure(text="✅ Gemini ativo", text_color=COR_SUCESSO)
+                elif provedor == "openrouter_free":
+                    self.lbl_status_api.configure(text="🟢 OpenRouter free ativo", text_color=COR_SUCESSO)
+                elif provedor == "ollama_local":
+                    self.lbl_status_api.configure(text="🟢 IA local ativa", text_color=COR_SUCESSO)
+                elif provedor == "historico":
+                    self.lbl_status_api.configure(text="🟡 Resposta analítica local", text_color=COR_AVISO)
+                else:
+                    self.lbl_status_api.configure(text="🔴 Falha ao consultar assistente", text_color=COR_PERIGO)
+
+                self._exibir("🤖 Vorcaro", texto_resposta, COR_PRIMARIA)
+                if random.random() <= self._chance_meme_auto:
+                    self._exibir("😏 Meme Vorcaro", self.app.proximo_meme_gui(), COR_AVISO)
                 self._set_pensando(False)
 
             _after_seguro(self, 0, _atualizar)
 
         threading.Thread(target=responder, daemon=True).start()
+
+    def receber_meme_automatico(self):
+        if random.random() <= self._chance_meme_auto:
+            self._exibir("😏 Meme Vorcaro", self.app.proximo_meme_gui(), COR_AVISO)
 
 
 # ================================================
@@ -4868,6 +5426,70 @@ class ConfiguracoesFrame(ctk.CTkFrame):
 
         self._atualizar_status_telegram()
 
+        # Memes e Humor
+        sec_memes = self._secao("😏 Memes e Humor", row); row += 1
+        
+        # Telegram meme frequency
+        lbl_tel_meme = ctk.CTkLabel(sec_memes, text="Frequência de Memes no Telegram:", 
+                                    text_color=COR_TEXTO, font=ctk.CTkFont(size=11))
+        lbl_tel_meme.pack(anchor="w", padx=15, pady=(10, 5))
+        
+        telegram_meme_freq = float(os.getenv("TELEGRAM_MEME_AUTO_CHANCE", "0.35")) * 100
+        self.lbl_telegram_meme_freq = ctk.CTkLabel(sec_memes, text=f"{int(telegram_meme_freq)}%",
+                                                    text_color=COR_PRIMARIA, 
+                                                    font=ctk.CTkFont(size=12, weight="bold"))
+        self.lbl_telegram_meme_freq.pack(anchor="e", padx=15, pady=(0, 5))
+        
+        self.slider_telegram_meme = ctk.CTkSlider(
+            sec_memes,
+            from_=0, to=100,
+            number_of_steps=20,
+            fg_color=COR_PRIMARIA,
+            progress_color=COR_SUCESSO,
+            command=self._atualizar_freq_telegram_meme
+        )
+        self.slider_telegram_meme.set(telegram_meme_freq)
+        self.slider_telegram_meme.pack(fill="x", padx=15, pady=(0, 20))
+        
+        # GUI meme frequency
+        lbl_gui_meme = ctk.CTkLabel(sec_memes, text="Frequência de Memes na GUI:", 
+                                   text_color=COR_TEXTO, font=ctk.CTkFont(size=11))
+        lbl_gui_meme.pack(anchor="w", padx=15, pady=(0, 5))
+        
+        gui_meme_freq = float(os.getenv("GUI_MEME_AUTO_CHANCE", "0.45")) * 100
+        self.lbl_gui_meme_freq = ctk.CTkLabel(sec_memes, text=f"{int(gui_meme_freq)}%",
+                                               text_color=COR_PRIMARIA, 
+                                               font=ctk.CTkFont(size=12, weight="bold"))
+        self.lbl_gui_meme_freq.pack(anchor="e", padx=15, pady=(0, 5))
+        
+        self.slider_gui_meme = ctk.CTkSlider(
+            sec_memes,
+            from_=0, to=100,
+            number_of_steps=20,
+            fg_color=COR_PRIMARIA,
+            progress_color=COR_SUCESSO,
+            command=self._atualizar_freq_gui_meme
+        )
+        self.slider_gui_meme.set(gui_meme_freq)
+        self.slider_gui_meme.pack(fill="x", padx=15, pady=(0, 15))
+        
+        # Botão salvar memes
+        ctk.CTkButton(
+            sec_memes,
+            text="💾 Salvar Preferências de Memes",
+            fg_color=COR_SUCESSO,
+            hover_color="#1E8449",
+            command=self._salvar_memes_config,
+        ).pack(pady=(0, 15))
+        
+        ctk.CTkLabel(
+            sec_memes,
+            text="Ajuste a frequência com que memes aparecem automaticamente no sistema.",
+            text_color=COR_TEXTO_SUAVE,
+            font=ctk.CTkFont(size=11),
+            justify="left",
+        ).pack(anchor="w", padx=15, pady=(0, 10))
+
         # Sobre
         sec4 = self._secao("ℹ️ Sobre", row); row += 1
         ctk.CTkLabel(sec4, text=(
@@ -4972,6 +5594,42 @@ class ConfiguracoesFrame(ctk.CTkFrame):
                 "Falha ao enviar mensagem. Verifique token e chat id.",
                 parent=self,
             )
+
+    def _atualizar_freq_telegram_meme(self, valor: float):
+        """Atualiza o label de frequência de memes no Telegram."""
+        self.lbl_telegram_meme_freq.configure(text=f"{int(float(valor))}%")
+
+    def _atualizar_freq_gui_meme(self, valor: float):
+        """Atualiza o label de frequência de memes na GUI."""
+        self.lbl_gui_meme_freq.configure(text=f"{int(float(valor))}%")
+
+    def _salvar_memes_config(self):
+        """Salva as configurações de frequência de memes no .env."""
+        telegram_freq = self.slider_telegram_meme.get() / 100.0
+        gui_freq = self.slider_gui_meme.get() / 100.0
+        
+        env_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            ".env"
+        )
+        
+        _salvar_env_key(env_path, "TELEGRAM_MEME_AUTO_CHANCE", str(telegram_freq))
+        _salvar_env_key(env_path, "GUI_MEME_AUTO_CHANCE", str(gui_freq))
+        
+        os.environ["TELEGRAM_MEME_AUTO_CHANCE"] = str(telegram_freq)
+        os.environ["GUI_MEME_AUTO_CHANCE"] = str(gui_freq)
+        
+        # Atualizar a frequência no app também
+        if hasattr(self.app, '_chance_meme_auto'):
+            self.app._chance_meme_auto = gui_freq
+        
+        messagebox.showinfo(
+            "Memes",
+            f"Configurações salvas com sucesso!\n\n"
+            f"Telegram: {int(telegram_freq * 100)}%\n"
+            f"GUI: {int(gui_freq * 100)}%",
+            parent=self
+        )
 
 
 # ================================================
@@ -5858,6 +6516,12 @@ class PlannerFrame(ctk.CTkFrame):
     """Planner semanal com visão de tarefas por dia, área e prioridade."""
 
     _DIAS_PT  = ["Segunda","Terça","Quarta","Quinta","Sexta","Sábado","Domingo"]
+    _FAIXAS_HORARIO = [
+        ("manha", "Manhã", "☀", "09:00"),
+        ("tarde", "Tarde", "◐", "14:00"),
+        ("noite", "Noite", "☾", "19:00"),
+        ("flexivel", "Sem horário", "○", ""),
+    ]
     _COR_PRIORIDADE = {"alta": "#E74C3C", "media": "#F39C12", "baixa": "#27AE60"}
     _COR_STATUS     = {"a_fazer": "#95A5A6", "em_progresso": "#3498db", "concluido": "#27AE60"}
     _ICONE_AREA     = {"financeiro":"💰","pessoal":"👤","trabalho":"💼","saude":"🏥","outro":"📌"}
@@ -5950,6 +6614,74 @@ class PlannerFrame(ctk.CTkFrame):
         self._semana_inicio = hoje - timedelta(days=hoje.weekday())
         self.carregar()
 
+    def _hora_para_minutos(self, hora_txt: Optional[str]) -> Optional[int]:
+        if not hora_txt:
+            return None
+        try:
+            hh, mm = str(hora_txt).split(":", 1)
+            hora = int(hh)
+            minuto = int(mm)
+        except Exception:
+            return None
+        if 0 <= hora <= 23 and 0 <= minuto <= 59:
+            return hora * 60 + minuto
+        return None
+
+    def _faixa_da_tarefa(self, tarefa) -> str:
+        inicio_min = self._hora_para_minutos(getattr(tarefa, "hora_inicio", None))
+        if inicio_min is None:
+            return "flexivel"
+        if inicio_min < 12 * 60:
+            return "manha"
+        if inicio_min < 18 * 60:
+            return "tarde"
+        return "noite"
+
+    def _renderizar_faixa_dia(self, parent, dia, chave_faixa: str, titulo: str, icone: str, hora_padrao: str, tarefas):
+        sec = ctk.CTkFrame(parent, fg_color="#162033", corner_radius=10, border_width=1, border_color=COR_BORDA)
+        sec.pack(fill="x", pady=(0, 8))
+
+        topo = ctk.CTkFrame(sec, fg_color="transparent")
+        topo.pack(fill="x", padx=8, pady=(7, 4))
+        ctk.CTkLabel(
+            topo,
+            text=f"{icone} {titulo}",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            text_color=COR_TEXTO,
+        ).pack(side="left")
+        ctk.CTkLabel(
+            topo,
+            text=f"{len(tarefas)} item(ns)",
+            font=ctk.CTkFont(size=9),
+            text_color=COR_TEXTO_SUAVE,
+        ).pack(side="right")
+
+        corpo = ctk.CTkFrame(sec, fg_color="transparent")
+        corpo.pack(fill="x", padx=6, pady=(0, 6))
+
+        if tarefas:
+            for tarefa in tarefas:
+                self._card_tarefa(corpo, tarefa)
+        else:
+            ctk.CTkLabel(
+                corpo,
+                text="Sem tarefas nesta faixa",
+                font=ctk.CTkFont(size=10),
+                text_color=COR_TEXTO_SUAVE,
+            ).pack(anchor="w", padx=6, pady=(2, 6))
+
+        ctk.CTkButton(
+            sec,
+            text="+ adicionar",
+            height=28,
+            fg_color="transparent",
+            border_width=1,
+            border_color=COR_BORDA,
+            text_color=COR_DESTAQUE,
+            hover_color="#1E293B",
+            command=lambda d=dia, hp=hora_padrao if chave_faixa != "flexivel" else None: self._dialog_tarefa(data_pre=d, hora_pre=hp),
+        ).pack(fill="x", padx=8, pady=(0, 8))
+
     def carregar(self):
         from datetime import timedelta
         semana_fim = self._semana_inicio + timedelta(days=6)
@@ -5985,6 +6717,8 @@ class PlannerFrame(ctk.CTkFrame):
         for t in tarefas:
             if t.data in por_dia:
                 por_dia[t.data].append(t)
+        for dia in por_dia:
+            por_dia[dia].sort(key=lambda tarefa: (str(getattr(tarefa, "hora_inicio", "") or "99:99"), str(getattr(tarefa, "prioridade", "z"))))
 
         # Reconstrói grade
         for w in self._grade.winfo_children():
@@ -6018,17 +6752,20 @@ class PlannerFrame(ctk.CTkFrame):
             col_frame = ctk.CTkFrame(self._grade, fg_color="transparent")
             col_frame.grid(row=1, column=col_i, padx=4, sticky="nsew")
 
-            if not lista:
-                ctk.CTkButton(
-                    col_frame, text="➕", width=40, height=28,
-                    fg_color="transparent", border_width=1,
-                    border_color=COR_TEXTO_SUAVE,
-                    text_color=COR_TEXTO_SUAVE,
-                    command=lambda d=dia: self._dialog_tarefa(data_pre=d),
-                ).pack(pady=(4,0))
-            else:
-                for t in lista:
-                    self._card_tarefa(col_frame, t)
+            tarefas_por_faixa = {chave: [] for chave, _, _, _ in self._FAIXAS_HORARIO}
+            for tarefa in lista:
+                tarefas_por_faixa[self._faixa_da_tarefa(tarefa)].append(tarefa)
+
+            for chave, titulo, icone, hora_padrao in self._FAIXAS_HORARIO:
+                self._renderizar_faixa_dia(
+                    col_frame,
+                    dia,
+                    chave,
+                    titulo,
+                    icone,
+                    hora_padrao,
+                    tarefas_por_faixa.get(chave, []),
+                )
 
         # Métricas
         self._lbl_metrics.configure(
@@ -6058,6 +6795,23 @@ class PlannerFrame(ctk.CTkFrame):
                      font=ctk.CTkFont(size=10, weight="bold"),
                      text_color=COR_TEXTO_SUAVE if status_v == "concluido" else COR_TEXTO,
                      anchor="w").pack(side="left", fill="x", expand=True)
+
+        horario_txt = ""
+        if getattr(tarefa, "hora_inicio", None) and getattr(tarefa, "hora_fim", None):
+            horario_txt = f"⏰ {tarefa.hora_inicio} - {tarefa.hora_fim}"
+        elif getattr(tarefa, "hora_inicio", None) and getattr(tarefa, "duracao_min", None):
+            horario_txt = f"⏰ {tarefa.hora_inicio}  •  {int(tarefa.duracao_min)} min"
+        elif getattr(tarefa, "hora_inicio", None):
+            horario_txt = f"⏰ Início {tarefa.hora_inicio}"
+
+        if horario_txt:
+            ctk.CTkLabel(
+                card,
+                text=horario_txt,
+                text_color=COR_DESTAQUE,
+                font=ctk.CTkFont(size=9),
+                anchor="w",
+            ).pack(fill="x", padx=8, pady=(0, 2))
 
         bot_row = ctk.CTkFrame(card, fg_color="transparent")
         bot_row.pack(fill="x", padx=6, pady=(0,5))
@@ -6119,6 +6873,9 @@ class PlannerFrame(ctk.CTkFrame):
                     "titulo":      t.titulo,
                     "descricao":   t.descricao or "",
                     "data":        t.data,
+                    "hora_inicio": t.hora_inicio or "",
+                    "hora_fim":    t.hora_fim or "",
+                    "duracao_min": t.duracao_min,
                     "prioridade":  t.prioridade.value if hasattr(t.prioridade,'value') else str(t.prioridade),
                     "status":      t.status.value     if hasattr(t.status,'value')     else str(t.status),
                     "area":        t.area.value        if hasattr(t.area,'value')       else str(t.area),
@@ -6130,7 +6887,7 @@ class PlannerFrame(ctk.CTkFrame):
             return
         self._dialog_tarefa(tarefa_id=tarefa_id, dados=dados)
 
-    def _dialog_tarefa(self, tarefa_id=None, dados=None, data_pre=None):
+    def _dialog_tarefa(self, tarefa_id=None, dados=None, data_pre=None, hora_pre=None):
         """
         Cria/edita tarefa com suporte a 3 modos:
           – Data única
@@ -6183,6 +6940,36 @@ class PlannerFrame(ctk.CTkFrame):
         cb_area   = _mkcombo("Área",       ["financeiro","pessoal","trabalho","saude","outro"], 1)
         cb_status = _mkcombo("Status",     ["a_fazer","em_progresso","concluido"], 2)
         cb_prio.set("media");  cb_area.set("pessoal");  cb_status.set("a_fazer")
+
+        agenda_row = ctk.CTkFrame(frm, fg_color="transparent")
+        agenda_row.pack(fill="x", padx=14, pady=(0, 12))
+        for _ci in range(3):
+            agenda_row.grid_columnconfigure(_ci, weight=1)
+
+        ctk.CTkLabel(agenda_row, text="Hora início", text_color=COR_TEXTO_SUAVE,
+                     font=ctk.CTkFont(size=11)).grid(row=0, column=0, sticky="w")
+        ctk.CTkLabel(agenda_row, text="Hora fim", text_color=COR_TEXTO_SUAVE,
+                     font=ctk.CTkFont(size=11)).grid(row=0, column=1, sticky="w")
+        ctk.CTkLabel(agenda_row, text="Duração (min)", text_color=COR_TEXTO_SUAVE,
+                     font=ctk.CTkFont(size=11)).grid(row=0, column=2, sticky="w")
+
+        e_hora_ini = ctk.CTkEntry(agenda_row, placeholder_text="08:30", width=120)
+        e_hora_ini.grid(row=1, column=0, padx=(0, 8), sticky="ew")
+        _aplicar_mascara_hora(e_hora_ini)
+
+        e_hora_fim = ctk.CTkEntry(agenda_row, placeholder_text="10:00", width=120)
+        e_hora_fim.grid(row=1, column=1, padx=(0, 8), sticky="ew")
+        _aplicar_mascara_hora(e_hora_fim)
+
+        e_duracao = ctk.CTkEntry(agenda_row, placeholder_text="90", width=120)
+        e_duracao.grid(row=1, column=2, sticky="ew")
+
+        ctk.CTkLabel(
+            frm,
+            text="Use início + fim ou início + duração. Se informar fim, ele prevalece sobre a duração.",
+            text_color=COR_DESTAQUE,
+            font=ctk.CTkFont(size=10),
+        ).pack(anchor="w", padx=14, pady=(0, 8))
 
         # ── Seção "Quando?" ───────────────────────────────────────────────
         sec_q = ctk.CTkFrame(d, fg_color=COR_CARD, corner_radius=12)
@@ -6426,10 +7213,33 @@ class PlannerFrame(ctk.CTkFrame):
                 messagebox.showwarning("Atenção", "O título é obrigatório.", parent=d)
                 return
 
+            try:
+                hora_inicio = _normalizar_hora_hhmm(e_hora_ini.get().strip()) if e_hora_ini.get().strip() else None
+                hora_fim = _normalizar_hora_hhmm(e_hora_fim.get().strip()) if e_hora_fim.get().strip() else None
+            except Exception:
+                messagebox.showwarning("Atenção", "Horário inválido. Use HH:MM.", parent=d)
+                return
+
+            duracao_txt = e_duracao.get().strip()
+            duracao_min = None
+            if duracao_txt:
+                try:
+                    duracao_min = max(1, int(duracao_txt))
+                except Exception:
+                    messagebox.showwarning("Atenção", "Duração inválida. Informe minutos inteiros.", parent=d)
+                    return
+
+            if (hora_fim or duracao_min is not None) and not hora_inicio:
+                messagebox.showwarning("Atenção", "Informe a hora de início para usar fim ou duração.", parent=d)
+                return
+
             payload_base = {
                 "titulo":     titulo,
                 "descricao":  e_desc.get().strip() or None,
                 "data":       None,
+                "hora_inicio": hora_inicio,
+                "hora_fim":    hora_fim,
+                "duracao_min": duracao_min,
                 "prioridade": cb_prio.get(),
                 "status":     cb_status.get(),
                 "area":       cb_area.get(),
@@ -6481,9 +7291,15 @@ class PlannerFrame(ctk.CTkFrame):
         if dados:
             e_titulo.insert(0, dados.get("titulo", ""))
             e_desc.insert(0,   dados.get("descricao", "") or "")
+            e_hora_ini.insert(0, dados.get("hora_inicio", "") or "")
+            e_hora_fim.insert(0, dados.get("hora_fim", "") or "")
+            if dados.get("duracao_min") is not None:
+                e_duracao.insert(0, str(dados.get("duracao_min")))
             cb_prio.set(  dados.get("prioridade", "media"))
             cb_status.set(dados.get("status",      "a_fazer"))
             cb_area.set(  dados.get("area",        "pessoal"))
+        elif hora_pre:
+            e_hora_ini.insert(0, hora_pre)
 
         # Inicia no modo "Data única"
         _build_unica()

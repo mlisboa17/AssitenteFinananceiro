@@ -16,6 +16,7 @@ from app.models import (
     EventoFinanceiro, StatusEvento, TipoEvento,
     Compromisso,
     TarefaPlanner, StatusTarefa, PrioridadeTarefa, AreaTarefa,
+    Transacao, TipoTransacao, FormaPagamento,
 )
 
 
@@ -75,12 +76,106 @@ def marcar_pago(db: Session, evento_id: int) -> Optional[EventoFinanceiro]:
         return None
     ev.status  = StatusEvento.PAGO if ev.tipo != TipoEvento.RECEITA else StatusEvento.RECEBIDO
     ev.pago_em = datetime.utcnow()
+
+    if ev.transacao_id is None and ev.tipo in {TipoEvento.CONTA, TipoEvento.PARCELA, TipoEvento.OUTRO}:
+        forma_pagamento = _inferir_forma_pagamento_evento(ev)
+        transacao = Transacao(
+            data=ev.pago_em.date(),
+            descricao=ev.titulo,
+            valor=abs(float(ev.valor or 0.0)),
+            tipo=TipoTransacao.DEBITO,
+            observacao=ev.descricao,
+            forma_pagamento=forma_pagamento,
+            fonte="agenda_financeira",
+            categoria_id=ev.categoria_id,
+            conta_id=ev.conta_id,
+            cartao_id=ev.cartao_id,
+        )
+        db.add(transacao)
+        db.flush()
+        ev.transacao_id = transacao.id
+
     # Cria próxima ocorrência se recorrente
     if ev.recorrente and ev.dia_recorrencia:
         _criar_proxima_recorrencia(db, ev)
     db.commit()
     db.refresh(ev)
     return ev
+
+
+def quitar_evento(
+    db: Session,
+    evento_id: int,
+    *,
+    conta_id: int | None = None,
+    cartao_id: int | None = None,
+    forma_pagamento: str | None = None,
+    data_pagamento: date | None = None,
+    descricao_transacao: str | None = None,
+) -> Optional[EventoFinanceiro]:
+    ev = db.query(EventoFinanceiro).get(evento_id)
+    if not ev:
+        return None
+
+    if conta_id is not None:
+        ev.conta_id = conta_id
+    if cartao_id is not None:
+        ev.cartao_id = cartao_id
+
+    ev.status = StatusEvento.PAGO if ev.tipo != TipoEvento.RECEITA else StatusEvento.RECEBIDO
+    instante_pagamento = datetime.utcnow()
+    if data_pagamento is not None:
+        instante_pagamento = datetime.combine(data_pagamento, datetime.min.time())
+    ev.pago_em = instante_pagamento
+
+    if ev.tipo == TipoEvento.FATURA_CARTAO:
+        db.commit()
+        db.refresh(ev)
+        return ev
+
+    if ev.transacao_id is None and ev.tipo in {TipoEvento.CONTA, TipoEvento.PARCELA, TipoEvento.OUTRO}:
+        forma = _coagir_forma_pagamento(forma_pagamento) or _inferir_forma_pagamento_evento(ev)
+        transacao = Transacao(
+            data=instante_pagamento.date(),
+            descricao=descricao_transacao or ev.titulo,
+            valor=abs(float(ev.valor or 0.0)),
+            tipo=TipoTransacao.DEBITO,
+            observacao=ev.descricao,
+            forma_pagamento=forma,
+            fonte="agenda_financeira",
+            categoria_id=ev.categoria_id,
+            conta_id=ev.conta_id,
+            cartao_id=ev.cartao_id,
+        )
+        db.add(transacao)
+        db.flush()
+        ev.transacao_id = transacao.id
+
+    if ev.recorrente and ev.dia_recorrencia:
+        _criar_proxima_recorrencia(db, ev)
+
+    db.commit()
+    db.refresh(ev)
+    return ev
+
+
+def _coagir_forma_pagamento(valor: str | None) -> FormaPagamento | None:
+    if not valor:
+        return None
+    try:
+        return FormaPagamento(valor)
+    except ValueError:
+        return None
+
+
+def _inferir_forma_pagamento_evento(ev: EventoFinanceiro) -> FormaPagamento:
+    if ev.cartao_id:
+        return FormaPagamento.CARTAO_CREDITO
+    if ev.codigo_barras:
+        return FormaPagamento.BOLETO_CONTA
+    if ev.conta_id:
+        return FormaPagamento.PIX_TRANSFERENCIA
+    return FormaPagamento.DINHEIRO
 
 
 def _criar_proxima_recorrencia(db: Session, ev: EventoFinanceiro):
@@ -197,7 +292,7 @@ def listar_tarefas(db: Session,
     elif semana_inicio:
         semana_fim = semana_inicio + timedelta(days=6)
         q = q.filter(TarefaPlanner.data.between(semana_inicio, semana_fim))
-    return q.order_by(TarefaPlanner.data, TarefaPlanner.prioridade).all()
+    return q.order_by(TarefaPlanner.data, TarefaPlanner.hora_inicio, TarefaPlanner.prioridade).all()
 
 
 def criar_tarefa(db: Session, dados: Dict[str, Any]) -> TarefaPlanner:

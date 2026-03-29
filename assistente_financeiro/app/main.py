@@ -94,8 +94,11 @@ from app.services.metas_service      import MetasService
 from app.services.historico_service  import HistoricoService
 from app.services.gemini_service     import GeminiService
 from app.services.classifier_service import ClassifierService
+from app.services.local_ai_service   import LocalAIService
+from app.services.openrouter_service import OpenRouterService
 from app.services.notificacoes.telegram_service import TelegramService
 from app.services.notificacoes.voice_processor  import VoiceProcessor
+from app.routes.planner_routes import router as planner_router
 
 # Configuração do logger
 logging.basicConfig(level=logging.INFO)
@@ -197,6 +200,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(planner_router)
 
 
 # ================================================
@@ -323,16 +328,42 @@ def _processar_texto_telegram(
     if not _chat_telegram_autorizado(svc, chat_id, msg=msg):
         return
 
-    if texto.lower() in {"/start", "/help", "ajuda"}:
+    texto_norm_global = _normalizar_texto_telegram(texto)
+
+    # Atalhos por botao do teclado Telegram.
+    if texto_norm_global in {"menu", "inicio"}:
+        loop.run_until_complete(
+            svc.enviar_mensagem(
+                "🏠 Menu principal aberto. Escolha uma opção:",
+                chat_id=chat_id,
+                botoes=svc.teclado_menu_principal(),
+            )
+        )
+        return
+
+    if texto_norm_global in {"limpar contexto", "limpar"}:
+        svc.limpar_contexto(chat_id)
+        loop.run_until_complete(
+            svc.enviar_mensagem(
+                "🧹 Contexto limpo com sucesso.",
+                chat_id=chat_id,
+                botoes=svc.teclado_menu_principal(),
+            )
+        )
+        return
+
+    if texto.lower() in {"/start", "/help", "ajuda"} or texto_norm_global in {"ajuda", "lancar despesa", "importar documento"}:
         loop.run_until_complete(
             svc.enviar_mensagem(
                 (
                     svc.mensagem_ajuda_despesa()
                     + "\n\n📎 Você também pode enviar arquivo/foto.\n"
                       "Eu detecto o tipo e pergunto se deseja salvar, alterar ou cancelar.\n\n"
+                      "🎙️ Você também pode enviar áudio/voz para lançar despesa.\n"
                       "💬 Também converso com contexto. Para limpar a conversa, envie: limpar contexto"
                 ),
                 chat_id=chat_id,
+                botoes=svc.teclado_menu_principal(),
             )
         )
         return
@@ -343,12 +374,26 @@ def _processar_texto_telegram(
             _processar_pendencia_documento_telegram(svc, chat_id, texto, loop, pendencia)
             return
 
-        texto_norm = texto.strip().lower()
+        texto_norm = _normalizar_texto_telegram(texto)
 
-        if texto_norm in {"cancelar", "c", "3"}:
+        if texto_norm in {"cancelar", "c", "3", "cancelar lancamento", "cancelar importacao"}:
             _TELEGRAM_PENDENCIAS.pop(chat_id, None)
             loop.run_until_complete(
-                svc.enviar_mensagem("❌ Lançamento cancelado.", chat_id=chat_id)
+                svc.enviar_mensagem(
+                    "❌ Lançamento cancelado.",
+                    chat_id=chat_id,
+                    botoes=svc.teclado_menu_principal(),
+                )
+            )
+            return
+
+        if texto_norm in {"editar", "alterar despesa"}:
+            pendencia["aguardando_alteracao"] = True
+            loop.run_until_complete(
+                svc.enviar_mensagem(
+                    "✏️ Envie a despesa corrigida (ex: restaurante 50 ou 50 gasolina).",
+                    chat_id=chat_id,
+                )
             )
             return
 
@@ -367,7 +412,11 @@ def _processar_texto_telegram(
             pendencia["texto_original"] = texto
             pendencia["aguardando_alteracao"] = False
             loop.run_until_complete(
-                svc.enviar_mensagem(_mensagem_confirmacao_pendente(comando_alt), chat_id=chat_id)
+                svc.enviar_mensagem(
+                    _mensagem_confirmacao_pendente(comando_alt),
+                    chat_id=chat_id,
+                    botoes=_teclado_confirmacao_despesa_telegram(),
+                )
             )
             return
 
@@ -397,11 +446,15 @@ def _processar_texto_telegram(
             pendencia["texto_original"] = novo_texto
             pendencia["aguardando_alteracao"] = False
             loop.run_until_complete(
-                svc.enviar_mensagem(_mensagem_confirmacao_pendente(comando_alt), chat_id=chat_id)
+                svc.enviar_mensagem(
+                    _mensagem_confirmacao_pendente(comando_alt),
+                    chat_id=chat_id,
+                    botoes=_teclado_confirmacao_despesa_telegram(),
+                )
             )
             return
 
-        if texto_norm in {"salvar", "s", "1", "confirmar", "ok"}:
+        if texto_norm in {"salvar", "s", "1", "confirmar", "ok", "salvar lancamento", "confirmar lancamento"}:
             comando_pendente = pendencia.get("comando") or {}
             _TELEGRAM_PENDENCIAS.pop(chat_id, None)
             _salvar_transacao_telegram(svc, chat_id, comando_pendente, loop)
@@ -409,8 +462,9 @@ def _processar_texto_telegram(
 
         loop.run_until_complete(
             svc.enviar_mensagem(
-                "Responda com: salvar, alterar ou cancelar.",
+                "Escolha uma ação nos botões abaixo:",
                 chat_id=chat_id,
+                botoes=_teclado_confirmacao_despesa_telegram(),
             )
         )
         return
@@ -470,7 +524,11 @@ def _processar_texto_telegram(
     }
 
     loop.run_until_complete(
-        svc.enviar_mensagem(_mensagem_confirmacao_pendente(comando), chat_id=chat_id)
+        svc.enviar_mensagem(
+            _mensagem_confirmacao_pendente(comando),
+            chat_id=chat_id,
+            botoes=_teclado_confirmacao_despesa_telegram(),
+        )
     )
 
 
@@ -631,10 +689,7 @@ def _mensagem_confirmacao_pendente(comando: Dict[str, Any]) -> str:
         f"📝 Descrição: {descricao}\n"
         f"💵 Valor: {valor_txt}\n"
         f"📅 Data: {data_txt}\n\n"
-        "Responda com:\n"
-        "• salvar\n"
-        "• alterar\n"
-        "• cancelar"
+        "Use os botões abaixo para confirmar, alterar ou cancelar."
     )
 
 
@@ -767,7 +822,11 @@ def _mensagem_confirmacao_documento_pendente(pendencia: Dict[str, Any]) -> str:
 
 
 def _teclado_confirmacao_documento_telegram() -> List[List[str]]:
-    return [["OK"]]
+    return [["✅ Confirmar"], ["✏️ Alterar tipo", "❌ Cancelar"]]
+
+
+def _teclado_confirmacao_despesa_telegram() -> List[List[str]]:
+    return [["✅ Salvar lançamento"], ["✏️ Alterar despesa", "❌ Cancelar"]]
 
 
 def _baixar_arquivo_telegram(
@@ -874,9 +933,9 @@ def _processar_pendencia_documento_telegram(
     loop: asyncio.AbstractEventLoop,
     pendencia: Dict[str, Any],
 ) -> None:
-    texto_norm = (texto or "").strip().lower()
+    texto_norm = _normalizar_texto_telegram(texto)
 
-    if texto_norm in {"cancelar", "c"}:
+    if texto_norm in {"cancelar", "c", "cancelar importacao"}:
         _TELEGRAM_PENDENCIAS.pop(chat_id, None)
         caminho = pendencia.get("caminho")
         try:
@@ -887,7 +946,7 @@ def _processar_pendencia_documento_telegram(
         loop.run_until_complete(svc.enviar_mensagem("❌ Importação cancelada.", chat_id=chat_id))
         return
 
-    if texto_norm in {"correto", "salvar", "s", "confirmar", "ok"}:
+    if texto_norm in {"correto", "salvar", "s", "confirmar", "ok", "confirmar", "confirmar documento"}:
         _TELEGRAM_PENDENCIAS.pop(chat_id, None)
         _salvar_documento_telegram(svc, chat_id, pendencia, loop)
         return
@@ -897,6 +956,16 @@ def _processar_pendencia_documento_telegram(
         arg = texto_norm
     elif texto_norm.startswith("alterar"):
         arg = (texto or "")[len("alterar"):].strip(" :")
+
+    if texto_norm in {"alterar tipo", "alterar tipo documento"}:
+        loop.run_until_complete(
+            svc.enviar_mensagem(
+                "Informe o novo tipo com o número da lista abaixo:\n\n" + _opcoes_tipos_documento_telegram(),
+                chat_id=chat_id,
+                botoes=_teclado_confirmacao_documento_telegram(),
+            )
+        )
+        return
 
     if arg:
         if not arg:
@@ -958,6 +1027,10 @@ def _processar_arquivo_telegram(
 
     documento = getattr(msg, "document", None)
     fotos = getattr(msg, "photo", None)
+    voz = getattr(msg, "voice", None)
+    audio = getattr(msg, "audio", None)
+
+    is_audio = False
 
     if documento:
         file_id = getattr(documento, "file_id", None)
@@ -968,6 +1041,27 @@ def _processar_arquivo_telegram(
         file_id = getattr(foto, "file_id", None)
         nome_original = "foto_telegram.jpg"
         ext = ".jpg"
+    elif voz:
+        file_id = getattr(voz, "file_id", None)
+        nome_original = "voice_telegram.ogg"
+        ext = ".ogg"
+        is_audio = True
+    elif audio:
+        file_id = getattr(audio, "file_id", None)
+        nome_original = getattr(audio, "file_name", None) or "audio_telegram"
+        ext = Path(nome_original).suffix.lower()
+        if not ext:
+            mime = str(getattr(audio, "mime_type", "") or "").lower()
+            if "ogg" in mime or "opus" in mime:
+                ext = ".ogg"
+            elif "mpeg" in mime or "mp3" in mime:
+                ext = ".mp3"
+            elif "m4a" in mime or "mp4" in mime:
+                ext = ".m4a"
+            else:
+                ext = ".ogg"
+            nome_original = f"audio_telegram{ext}"
+        is_audio = True
 
     if not file_id:
         loop.run_until_complete(
@@ -975,24 +1069,48 @@ def _processar_arquivo_telegram(
         )
         return
 
-    suportados = set(ImportService.EXTENSOES_DOCUMENTO)
-    if ext not in suportados:
-        loop.run_until_complete(
-            svc.enviar_mensagem(
-                "Formato ainda não suportado no fluxo automático do Telegram.\n"
-                f"Envie um destes: {', '.join(sorted(suportados))}",
-                chat_id=chat_id,
+    if is_audio:
+        suportados_audio = set(VoiceProcessor.FORMATOS_SUPORTADOS)
+        if ext not in suportados_audio:
+            loop.run_until_complete(
+                svc.enviar_mensagem(
+                    "Formato de áudio não suportado para transcrição.\n"
+                    f"Envie um destes: {', '.join(sorted(suportados_audio))}",
+                    chat_id=chat_id,
+                    botoes=svc.teclado_menu_principal(),
+                )
             )
-        )
-        return
+            return
+    else:
+        suportados = set(ImportService.EXTENSOES_DOCUMENTO)
+        if ext not in suportados:
+            loop.run_until_complete(
+                svc.enviar_mensagem(
+                    "Formato ainda não suportado no fluxo automático do Telegram.\n"
+                    f"Envie um destes: {', '.join(sorted(suportados))}",
+                    chat_id=chat_id,
+                    botoes=svc.teclado_menu_principal(),
+                )
+            )
+            return
 
     # Avisa imediatamente que o arquivo foi recebido e está sendo processado.
-    loop.run_until_complete(
-        svc.enviar_mensagem(
-            f"📥 Arquivo recebido ({nome_original}). Analisando, aguarde...",
-            chat_id=chat_id,
+    if is_audio:
+        loop.run_until_complete(
+            svc.enviar_mensagem(
+                f"🎙️ Áudio recebido ({nome_original}). Transcrevendo, aguarde...",
+                chat_id=chat_id,
+                botoes=svc.teclado_menu_principal(),
+            )
         )
-    )
+    else:
+        loop.run_until_complete(
+            svc.enviar_mensagem(
+                f"📥 Arquivo recebido ({nome_original}). Analisando, aguarde...",
+                chat_id=chat_id,
+                botoes=svc.teclado_menu_principal(),
+            )
+        )
 
     try:
         caminho_local = _baixar_arquivo_telegram(svc, loop, file_id, nome_original, ext)
@@ -1003,12 +1121,78 @@ def _processar_arquivo_telegram(
         )
         return
 
+    if is_audio:
+        try:
+            voice = VoiceProcessor()
+            transcricao = voice.transcrever_audio(caminho_local)
+
+            if str(transcricao).startswith("[Erro"):
+                loop.run_until_complete(
+                    svc.enviar_mensagem(
+                        "❌ Não consegui transcrever o áudio.\n"
+                        f"Detalhe: {transcricao}",
+                        chat_id=chat_id,
+                        botoes=svc.teclado_menu_principal(),
+                    )
+                )
+                return
+
+            comando = svc.interpretar_comando_despesa(transcricao)
+            if not comando:
+                loop.run_until_complete(
+                    svc.enviar_mensagem(
+                        "❌ Entendi o áudio, mas não identifiquei um lançamento válido.\n"
+                        f"Transcrição: {transcricao}\n\n"
+                        "Exemplos que funcionam:\n"
+                        "• gasolina 100\n"
+                        "• padaria 70\n"
+                        "• almoço 40",
+                        chat_id=chat_id,
+                        botoes=svc.teclado_menu_principal(),
+                    )
+                )
+                return
+
+            _TELEGRAM_PENDENCIAS[chat_id] = {
+                "kind": "despesa",
+                "comando": comando,
+                "texto_original": transcricao,
+                "aguardando_alteracao": False,
+                "origem": "voz",
+            }
+
+            loop.run_until_complete(
+                svc.enviar_mensagem(
+                    "🎙️ Áudio transcrito:\n"
+                    f"{transcricao}\n\n"
+                    f"{_mensagem_confirmacao_pendente(comando)}",
+                    chat_id=chat_id,
+                    botoes=_teclado_confirmacao_despesa_telegram(),
+                )
+            )
+        except Exception:
+            logger.exception("Falha ao processar áudio do Telegram")
+            loop.run_until_complete(
+                svc.enviar_mensagem(
+                    "❌ Não consegui processar o áudio agora. Tente novamente em instantes.",
+                    chat_id=chat_id,
+                    botoes=svc.teclado_menu_principal(),
+                )
+            )
+        finally:
+            try:
+                if os.path.exists(caminho_local):
+                    os.remove(caminho_local)
+            except Exception:
+                pass
+        return
+
     db = None
     try:
         from app.database import SessionLocal
         db = SessionLocal()
         analise = ImportService(db).analisar_documento(caminho_local)
-    except Exception as exc:
+    except Exception:
         logger.exception("Falha ao analisar arquivo do Telegram")
         loop.run_until_complete(
             svc.enviar_mensagem("❌ Não consegui analisar o documento. Verifique se o arquivo é legível.", chat_id=chat_id)
@@ -1353,7 +1537,12 @@ def _iniciar_worker_telegram_polling() -> None:
                         continue
                     if getattr(msg, "text", None):
                         _processar_texto_telegram(svc, str(msg.chat_id), str(msg.text), loop, msg=msg)
-                    elif getattr(msg, "document", None) or getattr(msg, "photo", None):
+                    elif (
+                        getattr(msg, "document", None)
+                        or getattr(msg, "photo", None)
+                        or getattr(msg, "voice", None)
+                        or getattr(msg, "audio", None)
+                    ):
                         _processar_arquivo_telegram(svc, str(msg.chat_id), msg, loop)
 
             except Exception as _poll_exc:
@@ -1572,6 +1761,81 @@ def criar_cartao(dados: CartaoCreditoCreate, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(c)
     return c
+
+
+# ================================================
+# AGENDA (Financeira + Compromissos)
+# ================================================
+
+@app.get("/agenda/financeira/{data_ref}", tags=["Agenda"])
+def agenda_financeira_dia(data_ref: str, db: Session = Depends(get_db)):
+    """Lista eventos financeiros para a data informada (AAAA-MM-DD)."""
+    try:
+        data_obj = datetime.strptime(data_ref, "%Y-%m-%d").date()
+    except Exception:
+        raise HTTPException(400, "Data inválida. Use o formato AAAA-MM-DD")
+
+    eventos = (
+        db.query(EventoFinanceiro)
+        .filter(EventoFinanceiro.data_vencimento == data_obj)
+        .order_by(EventoFinanceiro.data_vencimento.asc(), EventoFinanceiro.id.asc())
+        .all()
+    )
+
+    itens = [
+        {
+            "id": int(ev.id),
+            "titulo": str(ev.titulo or "Evento"),
+            "descricao": str(ev.descricao or ""),
+            "valor": float(ev.valor or 0.0),
+            "tipo": str(getattr(ev.tipo, "value", ev.tipo) or "outro"),
+            "status": str(getattr(ev.status, "value", ev.status) or "pendente"),
+            "data_vencimento": ev.data_vencimento.isoformat() if ev.data_vencimento else data_ref,
+        }
+        for ev in eventos
+    ]
+
+    return {
+        "data": data_ref,
+        "total": len(itens),
+        "itens": itens,
+    }
+
+
+@app.get("/agenda/compromissos/{data_ref}", tags=["Agenda"])
+def agenda_compromissos_dia(data_ref: str, db: Session = Depends(get_db)):
+    """Lista compromissos para a data informada (AAAA-MM-DD)."""
+    try:
+        data_obj = datetime.strptime(data_ref, "%Y-%m-%d").date()
+    except Exception:
+        raise HTTPException(400, "Data inválida. Use o formato AAAA-MM-DD")
+
+    compromissos = (
+        db.query(Compromisso)
+        .filter(Compromisso.data == data_obj)
+        .order_by(Compromisso.hora_inicio.asc(), Compromisso.id.asc())
+        .all()
+    )
+
+    itens = [
+        {
+            "id": int(comp.id),
+            "titulo": str(comp.titulo or "Compromisso"),
+            "descricao": str(comp.descricao or ""),
+            "local": str(comp.local or ""),
+            "data": comp.data.isoformat() if comp.data else data_ref,
+            "hora_inicio": str(comp.hora_inicio or ""),
+            "hora_fim": str(comp.hora_fim or ""),
+            "concluido": bool(comp.concluido),
+        }
+        for comp in compromissos
+    ]
+
+    return {
+        "data": data_ref,
+        "total": len(itens),
+        "itens": itens,
+    }
 
 
 # ================================================
@@ -1926,12 +2190,22 @@ def assistente(dados: PerguntaAssistente, db: Session = Depends(get_db)):
     if api_key:
         try:
             resposta = GeminiService(api_key=api_key, db=db).enviar(dados.pergunta)
-            return {"pergunta": dados.pergunta, "resposta": resposta, "dados": None}
+            return {
+                "pergunta": dados.pergunta,
+                "resposta": resposta,
+                "dados": None,
+                "provedor": "gemini",
+            }
         except Exception as exc:
             logger.warning("GeminiService falhou, usando fallback: %s", exc)
+    else:
+        logger.info("GEMINI_API_KEY ausente no .env. Usando fallback de histórico.")
 
     resultado = HistoricoService(db).responder_pergunta(dados.pergunta)
-    return {"pergunta": dados.pergunta, **resultado}
+    retorno = {"pergunta": dados.pergunta, **resultado, "provedor": "fallback_historico"}
+    if not api_key:
+        retorno["configuracao"] = "GEMINI_API_KEY ausente no .env. Configure a chave para habilitar respostas pelo Gemini."
+    return retorno
 
 
 @app.post("/despesa/rapida", tags=["Assistente"])
@@ -1993,6 +2267,90 @@ async def processar_voz(
     return resultado
 
 
+@app.get("/diagnostico/ambiente", tags=["Diagnóstico"])
+def diagnostico_ambiente() -> Dict[str, Any]:
+    """Consolida o diagnóstico de variáveis de ambiente e serviços externos."""
+    gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
+    gemini = {
+        "ok": bool(gemini_key),
+        "mensagem": (
+            "Gemini configurado."
+            if gemini_key else
+            "GEMINI_API_KEY ausente no .env."
+        ),
+    }
+
+    try:
+        openrouter_diag = OpenRouterService().diagnostico()
+        openrouter = {
+            "ok": bool(openrouter_diag.get("enabled") and openrouter_diag.get("api_key_ok")),
+            "enabled": bool(openrouter_diag.get("enabled")),
+            "mensagem": str(openrouter_diag.get("mensagem") or "OpenRouter sem diagnóstico."),
+            "model": str(openrouter_diag.get("model") or ""),
+        }
+    except Exception as exc:
+        openrouter = {
+            "ok": False,
+            "enabled": False,
+            "mensagem": f"Falha ao inicializar OpenRouter: {exc}",
+            "model": "",
+        }
+
+    try:
+        local_diag = LocalAIService().diagnostico()
+        local_ai = {
+            "ok": bool(local_diag.get("enabled") and local_diag.get("ollama_ok")),
+            "enabled": bool(local_diag.get("enabled")),
+            "mensagem": str(local_diag.get("mensagem") or "IA local sem diagnóstico."),
+            "model": str(local_diag.get("model") or ""),
+        }
+    except Exception as exc:
+        local_ai = {
+            "ok": False,
+            "enabled": False,
+            "mensagem": f"Falha ao inicializar IA local: {exc}",
+            "model": "",
+        }
+
+    tg_status = TelegramService().status()
+    telegram = {
+        "ok": bool(tg_status.get("ativo") and tg_status.get("token_ok") and tg_status.get("chat_ok")),
+        "enabled": bool(tg_status.get("token_ok")),
+        "mensagem": str(tg_status.get("mensagem") or "Telegram sem diagnóstico."),
+    }
+
+    try:
+        voz_diag = VoiceProcessor().diagnostico()
+        voz = {
+            "ok": bool(voz_diag.get("ok")),
+            "mensagem": str(voz_diag.get("mensagem") or "Voz sem diagnóstico."),
+            "engine": str(voz_diag.get("engine") or ""),
+            "model": str(voz_diag.get("model") or ""),
+        }
+    except Exception as exc:
+        voz = {
+            "ok": False,
+            "mensagem": f"Falha ao inicializar serviço de voz: {exc}",
+            "engine": "",
+            "model": "",
+        }
+
+    servicos = {
+        "gemini": gemini,
+        "openrouter": openrouter,
+        "local_ai": local_ai,
+        "telegram": telegram,
+        "voz": voz,
+    }
+
+    pendencias = [nome for nome, item in servicos.items() if not item.get("ok")]
+    return {
+        "ok": len(pendencias) == 0,
+        "pendencias": pendencias,
+        "servicos": servicos,
+    }
+
+
 @app.get("/telegram/status", tags=["Telegram"])
 def telegram_status():
     """Verifica o status da integração com Telegram."""
@@ -2004,12 +2362,14 @@ async def telegram_teste(dados: TelegramTeste):
     """Envia uma mensagem de teste para validar token e chat id configurados."""
     svc = TelegramService()
     enviado = await svc.enviar_mensagem(dados.mensagem, chat_id=dados.chat_id)
+    status = svc.status()
+    detalhe = status.get("mensagem")
     return {
         "ok": enviado,
         "mensagem": (
             "Mensagem de teste enviada com sucesso."
             if enviado else
-            "Falha ao enviar mensagem de teste. Verifique token e chat id."
+            f"Falha ao enviar mensagem de teste. {detalhe or 'Verifique token e chat id.'}"
         ),
-        "status": svc.status(),
+        "status": status,
     }

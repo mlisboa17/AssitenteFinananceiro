@@ -1,0 +1,6 @@
+# Dependências para a interface Flet
+flet==0.83.0
+requests>=2.31.0
+python-dotenv>=1.0.0
+
+# (As dependências do backend já estão em requirements.txt)

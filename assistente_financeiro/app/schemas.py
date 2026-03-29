@@ -108,6 +108,10 @@ class TransacaoBase(BaseModel):
     valor:          float = Field(..., description="Valor absoluto (sempre positivo)")
     tipo:           str   = Field(..., pattern="^(debito|credito)$")
     observacao:     Optional[str]  = None
+    forma_pagamento: Optional[str] = Field(
+        None,
+        pattern="^(dinheiro|cartao_credito|pix_transferencia|boleto_conta)$",
+    )
     parcela_atual:  Optional[int]  = None
     parcelas_total: Optional[int]  = None
     fonte:          Optional[str]  = None
@@ -124,9 +128,15 @@ class TransacaoUpdate(BaseModel):
     valor:          Optional[float] = None
     tipo:           Optional[str]   = None
     observacao:     Optional[str]   = None
+    forma_pagamento: Optional[str]  = Field(
+        None,
+        pattern="^(dinheiro|cartao_credito|pix_transferencia|boleto_conta)$",
+    )
     parcela_atual:  Optional[int]   = None
     parcelas_total: Optional[int]   = None
     categoria_id:   Optional[int]   = None
+    conta_id:       Optional[int]   = None
+    cartao_id:      Optional[int]   = None
 
 class TransacaoRead(TransacaoBase):
     id:            int
@@ -136,6 +146,60 @@ class TransacaoRead(TransacaoBase):
     criado_em:     datetime
 
     model_config = {"from_attributes": True}
+
+
+class EventoFinanceiroBase(BaseModel):
+    titulo: str = Field(..., max_length=150)
+    descricao: Optional[str] = None
+    valor: float = Field(..., ge=0)
+    data_vencimento: date
+    tipo: str = Field(..., pattern="^(conta|receita|reserva|parcela|fatura_cartao|outro)$")
+    status: str = Field("pendente", pattern="^(pendente|pago|recebido|atrasado|cancelado)$")
+    recorrente: bool = False
+    dia_recorrencia: Optional[int] = Field(None, ge=1, le=31)
+    codigo_barras: Optional[str] = None
+    categoria_id: Optional[int] = None
+    conta_id: Optional[int] = None
+    cartao_id: Optional[int] = None
+
+
+class EventoFinanceiroCreate(EventoFinanceiroBase):
+    pass
+
+
+class EventoFinanceiroUpdate(BaseModel):
+    titulo: Optional[str] = Field(None, max_length=150)
+    descricao: Optional[str] = None
+    valor: Optional[float] = Field(None, ge=0)
+    data_vencimento: Optional[date] = None
+    tipo: Optional[str] = Field(None, pattern="^(conta|receita|reserva|parcela|fatura_cartao|outro)$")
+    status: Optional[str] = Field(None, pattern="^(pendente|pago|recebido|atrasado|cancelado)$")
+    recorrente: Optional[bool] = None
+    dia_recorrencia: Optional[int] = Field(None, ge=1, le=31)
+    codigo_barras: Optional[str] = None
+    categoria_id: Optional[int] = None
+    conta_id: Optional[int] = None
+    cartao_id: Optional[int] = None
+
+
+class EventoFinanceiroRead(EventoFinanceiroBase):
+    id: int
+    pago_em: Optional[datetime] = None
+    transacao_id: Optional[int] = None
+    criado_em: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class EventoFinanceiroPagamento(BaseModel):
+    data_pagamento: Optional[date] = None
+    conta_id: Optional[int] = None
+    cartao_id: Optional[int] = None
+    forma_pagamento: Optional[str] = Field(
+        None,
+        pattern="^(dinheiro|cartao_credito|pix_transferencia|boleto_conta)$",
+    )
+    descricao_transacao: Optional[str] = Field(None, max_length=255)
 
 
 # ================================================

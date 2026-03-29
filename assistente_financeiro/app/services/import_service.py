@@ -22,7 +22,15 @@ from typing import List, Optional, Dict, Any, TYPE_CHECKING
 
 from sqlalchemy.orm import Session
 
-from app.models import Transacao, Extrato, Categoria, EventoFinanceiro, CartaoCredito
+from app.models import (
+    Transacao,
+    Extrato,
+    Categoria,
+    EventoFinanceiro,
+    CartaoCredito,
+    FormaPagamento,
+    TipoEvento,
+)
 from app.services.ocr_service        import OCRService
 from app.services.parser_service     import ParserService
 from app.services.classifier_service import ClassifierService
@@ -451,7 +459,7 @@ class ImportService:
             )
             return _resumo_duplicado(extrato_assinatura)
 
-        # Se for fatura de cartão, sobrepõe todas as datas pelo dia de vencimento
+        # Para fatura de cartão, calcula o vencimento para registrar a obrigação na agenda.
         data_vencimento: Optional[date] = None
         if tipo == "cartao" and cartao_id:
             from app.models import CartaoCredito as _CartaoCredito
@@ -497,16 +505,19 @@ class ImportService:
                     ignoradas += 1
                     continue
 
-                # Regra de negócio: toda compra da fatura de cartão vira despesa
-                # na data de pagamento (vencimento) da fatura.
-                data_lancamento = data_vencimento if (tipo == "cartao" and data_vencimento) else bruta["data"]
-                tipo_lancamento = "debito" if tipo == "cartao" else bruta.get("tipo", "debito")
+                data_lancamento = bruta["data"]
+                tipo_lancamento = bruta.get("tipo", "debito")
+                forma_pagamento = self._inferir_forma_pagamento(
+                    conta_id=conta_id,
+                    cartao_id=cartao_id if tipo == "cartao" else bruta.get("cartao_id"),
+                )
 
                 t = Transacao(
                     data           = data_lancamento,
                     descricao      = bruta.get("descricao", "Sem descrição"),
                     valor          = abs(float(bruta["valor"])),
                     tipo           = tipo_lancamento,
+                    forma_pagamento = forma_pagamento,
                     parcela_atual  = bruta.get("parcela_atual"),
                     parcelas_total = bruta.get("parcelas_total"),
                     fonte          = bruta.get("fonte", banco),
@@ -527,6 +538,17 @@ class ImportService:
                 ignoradas += 1
 
         extrato.total_transacoes = importadas
+        evento_fatura_id = None
+        if tipo == "cartao" and cartao_id and importadas > 0:
+            valor_total_fatura = sum(abs(float(item.get("valor") or 0.0)) for item in transacoes_brutas)
+            evento_fatura = self._registrar_evento_fatura_cartao(
+                cartao_id=cartao_id,
+                arquivo_nome=arquivo_nome,
+                banco=banco,
+                valor_total=valor_total_fatura,
+                data_vencimento=data_vencimento or periodo_fim or date.today(),
+            )
+            evento_fatura_id = evento_fatura.id if evento_fatura else None
         self.db.commit()
 
         logger.info(f"Importação concluída: {importadas} transações | {ignoradas} ignoradas")
@@ -537,6 +559,8 @@ class ImportService:
             "arquivo":     arquivo_nome,
             "referencias_visuais": referencias_visuais,
         }
+        if evento_fatura_id is not None:
+            resultado["evento_fatura_id"] = evento_fatura_id
         return self._anexar_info_cartao_resultado(resultado, cartao_id=cartao_id)
 
     # ================================================
@@ -1460,6 +1484,22 @@ class ImportService:
                 or "Comprovante bancário"
             )
             tipo_mov = self._inferir_tipo_comprovante_bancario(texto)
+            evento_quitado = self._quitar_evento_por_comprovante(
+                texto=texto,
+                valor=valor,
+                conta_id=conta_id,
+                descricao=desc,
+            )
+            if evento_quitado is not None:
+                return {
+                    "importadas": 1,
+                    "ignoradas": 0,
+                    "evento_id": evento_quitado.id,
+                    "transacao_id": evento_quitado.transacao_id,
+                    "arquivo": os.path.basename(caminho),
+                    "tipo": "quitacao_evento",
+                    "valor": abs(valor),
+                }
             return self._criar_transacao_unica(
                 descricao=desc,
                 valor=valor,
@@ -1469,6 +1509,7 @@ class ImportService:
                 arquivo_path=caminho,
                 conta_id=conta_id,
                 cartao_id=None,
+                forma_pagamento=FormaPagamento.PIX_TRANSFERENCIA,
             )
 
         if tipo_documento == "recibo_despesa":
@@ -1489,6 +1530,7 @@ class ImportService:
                 arquivo_path=caminho,
                 conta_id=conta_id,
                 cartao_id=cartao_id,
+                forma_pagamento=self._inferir_forma_pagamento(conta_id=conta_id, cartao_id=cartao_id),
             )
 
         # ── Nota Fiscal: extrai valor e cria transação de despesa ─────────
@@ -1505,6 +1547,7 @@ class ImportService:
                 arquivo_path=caminho,
                 conta_id=conta_id,
                 cartao_id=cartao_id,
+                forma_pagamento=self._inferir_forma_pagamento(conta_id=conta_id, cartao_id=cartao_id),
             )
 
         # ── Boleto: extrai valor + vencimento e cria EventoFinanceiro ─────
@@ -1518,10 +1561,11 @@ class ImportService:
                 titulo          = desc,
                 valor           = valor,
                 data_vencimento = vencimento,
-                tipo            = "conta",
+                tipo            = TipoEvento.CONTA,
                 status          = "pendente",
                 codigo_barras   = cod_barras,
                 descricao       = f"Boleto importado de {os.path.basename(caminho)}",
+                conta_id        = conta_id,
             )
             self.db.add(ev)
             self.db.commit()
@@ -1551,6 +1595,7 @@ class ImportService:
                 arquivo_path=caminho,
                 conta_id=conta_id,
                 cartao_id=cartao_id,
+                forma_pagamento=FormaPagamento.CARTAO_CREDITO if cartao_id else self._inferir_forma_pagamento(conta_id=conta_id),
             )
 
         raise ValueError(f"Tipo de documento desconhecido: '{tipo_documento}'")
@@ -1569,6 +1614,7 @@ class ImportService:
         arquivo_path: str,
         conta_id: Optional[int] = None,
         cartao_id: Optional[int] = None,
+        forma_pagamento: Optional[FormaPagamento] = None,
     ) -> Dict[str, Any]:
         """Cria e persiste uma única Transacao no banco."""
         t = Transacao(
@@ -1580,6 +1626,7 @@ class ImportService:
             arquivo_origem = arquivo_nome,
             conta_id       = conta_id,
             cartao_id      = cartao_id,
+            forma_pagamento = forma_pagamento or self._inferir_forma_pagamento(conta_id=conta_id, cartao_id=cartao_id),
         )
         self.classifier.classificar_e_aplicar(t)
         self.db.add(t)
@@ -1594,6 +1641,111 @@ class ImportService:
             "tipo":         fonte,
             "valor":        abs(valor),
         }
+
+    def _inferir_forma_pagamento(
+        self,
+        *,
+        conta_id: Optional[int] = None,
+        cartao_id: Optional[int] = None,
+        codigo_barras: Optional[str] = None,
+    ) -> FormaPagamento:
+        if cartao_id:
+            return FormaPagamento.CARTAO_CREDITO
+        if codigo_barras:
+            return FormaPagamento.BOLETO_CONTA
+        if conta_id:
+            return FormaPagamento.PIX_TRANSFERENCIA
+        return FormaPagamento.DINHEIRO
+
+    def _registrar_evento_fatura_cartao(
+        self,
+        *,
+        cartao_id: int,
+        arquivo_nome: str,
+        banco: Optional[str],
+        valor_total: float,
+        data_vencimento: date,
+    ) -> EventoFinanceiro:
+        cartao = self.db.query(CartaoCredito).filter(CartaoCredito.id == cartao_id).first()
+        nome_cartao = cartao.nome if cartao else (banco or "Cartão")
+        titulo = f"Fatura {nome_cartao}"
+
+        existente = (
+            self.db.query(EventoFinanceiro)
+            .filter(
+                EventoFinanceiro.cartao_id == cartao_id,
+                EventoFinanceiro.tipo == TipoEvento.FATURA_CARTAO,
+                EventoFinanceiro.data_vencimento == data_vencimento,
+                EventoFinanceiro.status.in_(["pendente", "atrasado"]),
+            )
+            .first()
+        )
+        if existente:
+            existente.valor = abs(float(valor_total or 0.0))
+            existente.titulo = titulo
+            existente.descricao = f"Fatura importada de {arquivo_nome}"
+            self.db.flush()
+            return existente
+
+        evento = EventoFinanceiro(
+            titulo=titulo,
+            descricao=f"Fatura importada de {arquivo_nome}",
+            valor=abs(float(valor_total or 0.0)),
+            data_vencimento=data_vencimento,
+            tipo=TipoEvento.FATURA_CARTAO,
+            status="pendente",
+            cartao_id=cartao_id,
+        )
+        self.db.add(evento)
+        self.db.flush()
+        return evento
+
+    def _quitar_evento_por_comprovante(
+        self,
+        *,
+        texto: str,
+        valor: float,
+        conta_id: Optional[int],
+        descricao: str,
+    ) -> Optional[EventoFinanceiro]:
+        from app.services.agenda_service import quitar_evento
+
+        codigo_barras = self._extrair_codigo_barras(texto)
+        q = self.db.query(EventoFinanceiro).filter(
+            EventoFinanceiro.status.in_(["pendente", "atrasado"]),
+        )
+
+        if codigo_barras:
+            evento = q.filter(EventoFinanceiro.codigo_barras == codigo_barras).first()
+            if evento:
+                return quitar_evento(
+                    self.db,
+                    evento.id,
+                    conta_id=conta_id,
+                    forma_pagamento=FormaPagamento.BOLETO_CONTA.value,
+                    descricao_transacao=descricao or evento.titulo,
+                )
+
+        margem = 0.05
+        candidatos = q.all()
+        descricao_norm = normalizar_descricao(descricao or "")
+        for evento in candidatos:
+            if abs(float(evento.valor or 0.0) - abs(float(valor or 0.0))) > margem:
+                continue
+            titulo_norm = normalizar_descricao(evento.titulo or "")
+            if descricao_norm and titulo_norm and descricao_norm not in titulo_norm and titulo_norm not in descricao_norm:
+                continue
+
+            forma = FormaPagamento.BOLETO_CONTA.value if evento.codigo_barras else FormaPagamento.PIX_TRANSFERENCIA.value
+            return quitar_evento(
+                self.db,
+                evento.id,
+                conta_id=conta_id,
+                forma_pagamento=forma,
+                descricao_transacao=descricao or evento.titulo,
+            )
+
+        return None
 
     def _extrair_valor_documento(self, texto: str, tipo_documento: Optional[str] = None) -> Optional[float]:
         """Tenta extrair o valor monetário principal do texto do documento."""

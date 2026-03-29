@@ -41,10 +41,13 @@ python-telegram-bot>=20.6
 # IA com Google Gemini (assistente Vorcaro)
 google-genai>=1.0.0
 openai>=1.60.0
+faster-whisper>=1.1.0
 
 # Geração de relatórios PDF
 reportlab>=4.0.7
 
 # Interface gráfica moderna e leve
 customtkinter>=5.2.1
+CTkMessagebox>=2.7
 matplotlib>=3.8.2
+flet>=0.24.1

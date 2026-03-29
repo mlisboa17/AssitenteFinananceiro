@@ -114,6 +114,18 @@ notepad .env
 python run_gui.py
 ```
 
+### Nova Interface Flet (migração em andamento)
+
+```bash
+python run_flet.py
+```
+
+Status atual da migração Flet:
+- Dashboard consumindo `/dashboard/{mes}/{ano}`
+- Assistente conversacional consumindo `/assistente/`
+- Layout moderno responsivo com navegação lateral
+- Demais telas em migração progressiva
+
 A interface abre com 8 seções na barra lateral:
 
 | Seção | O que faz |
@@ -187,6 +199,44 @@ Perguntas que você pode fazer:
 "Qual o total de gastos em Transporte?"
 "Tenho metas vencendo?"
 ```
+
+### Fallback local do Vorcaro (sem custos)
+
+Quando o Gemini estiver sem créditos/limite, o Vorcaro pode assumir automaticamente com IA local usando Ollama.
+
+GitHub oficial: https://github.com/ollama/ollama
+
+1. Instale o Ollama
+2. Baixe um modelo local:
+   ```bash
+   ollama pull qwen2.5:3b
+   ```
+3. Configure no `.env`:
+   ```env
+   VORCARO_LOCAL_AI_ENABLED=true
+   OLLAMA_BASE_URL=http://127.0.0.1:11434
+   VORCARO_OLLAMA_MODEL=qwen2.5:3b
+   OLLAMA_TIMEOUT_SECONDS=90
+   ```
+4. Reinicie a aplicação
+
+Com isso, o fluxo do Vorcaro fica:
+- tenta Gemini
+- se falhar (quota/limite/erro), usa Ollama local automaticamente
+
+Opcional: você também pode configurar um fallback online gratuito antes do local:
+
+```env
+VORCARO_OPENROUTER_ENABLED=true
+OPENROUTER_API_KEY=sua_chave_openrouter_aqui
+OPENROUTER_MODEL=meta-llama/llama-3.1-8b-instruct:free
+OPENROUTER_TIMEOUT_SECONDS=45
+```
+
+Fluxo com OpenRouter habilitado:
+- tenta Gemini
+- se falhar, tenta OpenRouter free
+- se falhar, tenta Ollama local
 
 ---
 

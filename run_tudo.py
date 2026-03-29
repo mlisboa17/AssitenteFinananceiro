@@ -1,3 +1,4 @@
+import os
 import subprocess
 import sys
 import time
@@ -15,11 +16,15 @@ def main() -> int:
     base_dir = Path(__file__).resolve().parent
     app_dir = base_dir / "assistente_financeiro"
     api_script = app_dir / "run_api.py"
+    flet_script = app_dir / "run_flet.py"
     gui_script = app_dir / "run_gui.py"
 
-    if not api_script.exists() or not gui_script.exists():
-        print("Erro: nao encontrei run_api.py e run_gui.py em assistente_financeiro/.")
+    if not api_script.exists() or (not flet_script.exists() and not gui_script.exists()):
+        print("Erro: nao encontrei scripts de inicializacao em assistente_financeiro/.")
         return 1
+
+    ui_script = flet_script if flet_script.exists() else gui_script
+    ui_name = "Flet" if ui_script == flet_script else "GUI antiga"
 
     python_exec = _resolve_python_executable(base_dir)
 
@@ -36,8 +41,13 @@ def main() -> int:
             print(f"Erro: a API encerrou logo no inicio (codigo {api_proc.returncode}).")
             return api_proc.returncode or 1
 
-        print("API ativa. Iniciando interface grafica...")
-        gui_proc = subprocess.Popen([python_exec, str(gui_script)], cwd=str(app_dir))
+        print(f"API ativa. Iniciando interface {ui_name}...")
+        gui_env = None
+        if ui_script == flet_script:
+            gui_env = dict(os.environ)
+            # Evita que o run_flet tente subir outra API quando run_tudo ja iniciou uma.
+            gui_env["VORCARO_SKIP_FLET_API_AUTOSTART"] = "1"
+        gui_proc = subprocess.Popen([python_exec, str(ui_script)], cwd=str(app_dir), env=gui_env)
         gui_exit = gui_proc.wait()
 
         if gui_exit != 0:
